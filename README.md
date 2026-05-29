@@ -4,8 +4,6 @@ Official PyTorch implementation of **SynFIM-Q** — a unified Fisher Information
 
 > **SynFIM-Q** synergizes two CVPR 2025 works (APHQ-ViT and FIMA-Q) into a single framework where the **same Fisher Information Matrix** guides all three quantization stages: **MLP Reconstruction → Calibration → Block Reconstruction (AdaRound)**.
 
-![overview](./assets/main_fig.png)
-
 ## Key Contributions
 
 1. **Fisher-guided MLP Reconstruction (MR)** — Replaces the perturbation Hessian in APHQ-ViT with DPLR-FIM (Diagonal + Probabilistic Low-Rank Fisher), providing a more principled importance measure for MLP weight optimization. GELU activations are clamped and replaced with ReLU for quantization-friendliness.

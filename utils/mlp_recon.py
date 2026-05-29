@@ -238,8 +238,8 @@ class MLPReconstructor(QuantCalibrator):
         raw_grad = torch.cat(full_block.mlp.tmp_grad, dim=0)
         full_block.mlp.tmp_grad = None
         hook.remove()
-        # Diagonal Fisher: mean absolute gradient across batch
-        raw_grad = raw_grad.abs()
+        # Diagonal Fisher: flatten to (1, N*C) for loss consistency with low-rank mode
+        raw_grad = raw_grad.abs().reshape(raw_grad.shape[0], -1)
         full_block.mlp.raw_grad = raw_grad.mean(dim=0, keepdim=True) if self.use_mean_hessian else raw_grad
         full_block.mlp.delta_out = None
         full_block.mlp.inverse_B = None
@@ -418,13 +418,14 @@ class MLPLossFunction:
             rec_loss = self._lp_loss(pred, tgt, p=1.0) / 10
             quant_loss = self._lp_loss(quant_out, tgt, p=1.0) / 10
         elif self.rec_loss == 'fisher_diag':
-            # Diagonal Fisher: gradient magnitude as importance weight
-            cha = (pred - tgt).abs().reshape(pred.shape[0], -1)
-            rec_loss = (cha.pow(2) * grad.abs().mean(dim=0)).mean() / 10
-            quant_cha = (quant_out - tgt).abs().reshape(quant_out.shape[0], -1)
-            quant_loss = (quant_cha.pow(2) * grad.abs().mean(dim=0)).mean() / 10
+            # Diagonal Fisher: match APHQ pattern ((pred-tgt)^2 * |grad|).sum(1).mean() / 10
+            # grad from _compute_fisher_diag is (1, N*C) — reshape to (1, N, C) for per-token weighting
+            N, C = pred.shape[1], pred.shape[2]
+            grad_reshaped = grad.abs().reshape(1, N, C)
+            rec_loss = ((pred - tgt).pow(2) * grad_reshaped).sum(1).mean() / 10
+            quant_loss = ((quant_out - tgt).pow(2) * grad_reshaped).sum(1).mean() / 10
         elif self.rec_loss == 'fisher_lr':
-            # Low-rank Fisher: gradient-weighted with inverse_B
+            # Low-rank Fisher: (N*C)-flattened grad, inverse_B-weighted
             cha = (pred - tgt).abs().reshape(pred.shape[0], -1)
             A = cha.unsqueeze(1) @ grad.abs().transpose(0, 1)
             loss_lr = (A @ inverse_B @ A.transpose(1, 2)).mean()
@@ -438,10 +439,12 @@ class MLPLossFunction:
             quant_loss = quant_loss_lr / self.init_loss_1 / 10
         elif self.rec_loss == 'fisher_dplr':
             # DPLR-FIM: p1 * low_rank + p2 * diagonal
+            N, C = pred.shape[1], pred.shape[2]
+            grad_reshaped = grad.abs().reshape(1, N, C)
             cha = (pred - tgt).abs().reshape(pred.shape[0], -1)
             A = cha.unsqueeze(1) @ grad.abs().transpose(0, 1)
             loss_lr = (A @ inverse_B @ A.transpose(1, 2)).mean()
-            loss_diag = (cha.pow(2) * grad.abs().mean(dim=0)).mean()
+            loss_diag = ((pred - tgt).pow(2) * grad_reshaped).sum(1).mean()
             if self.init_loss_1 is None:
                 self.init_loss_1 = loss_lr.detach()
                 self.init_loss_2 = loss_diag.detach()
@@ -450,7 +453,7 @@ class MLPLossFunction:
             quant_cha = (quant_out - tgt).abs().reshape(quant_out.shape[0], -1)
             A_q = quant_cha.unsqueeze(1) @ grad.abs().transpose(0, 1)
             quant_loss_lr = (A_q @ inverse_B @ A_q.transpose(1, 2)).mean()
-            quant_loss_diag = (quant_cha.pow(2) * grad.abs().mean(dim=0)).mean()
+            quant_loss_diag = ((quant_out - tgt).pow(2) * grad_reshaped).sum(1).mean()
             quant_loss = (self.p1 * quant_loss_lr / self.init_loss_1 + self.p2 * quant_loss_diag / self.init_loss_2) / 10
         else:
             raise ValueError(f'Not supported rec_loss: {self.rec_loss}')
