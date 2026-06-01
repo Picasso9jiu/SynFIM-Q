@@ -78,7 +78,7 @@ def swin_patchmerging_forward(self, x):
 
 
 class BlockReconstructor(QuantCalibrator):
-    def __init__(self, model, optim_batch_size,calib_loader, metric="mse", temp=20, k=1, dis_mode='q', p1=1., p2=1.):
+    def __init__(self, model, optim_batch_size,calib_loader, metric="mse", temp=20, k=1, dis_mode='q', p1=1., p2=1., adaptive_k=True, adaptive_p=True):
         super().__init__(model, calib_loader)
         self.batch_size = optim_batch_size
         self.metric = metric
@@ -86,6 +86,8 @@ class BlockReconstructor(QuantCalibrator):
         self.dis_mode = dis_mode
         self.p1 = p1
         self.p2 = p2
+        self.adaptive_k = adaptive_k
+        self.adaptive_p = adaptive_p
         self.blocks = {}
         self.quanted_blocks = []
         self.raw_pred_softmaxs = None
@@ -100,7 +102,7 @@ class BlockReconstructor(QuantCalibrator):
             if any(isinstance(module, t) for t in types_of_block) or name.split('.')[-1] == 'head':
                 self.blocks[name] = module
                 BlockReconstructor._prepare_module_data_init(module)
-                
+
     @staticmethod
     def _prepare_module_data_init(module):
         module.raw_input = module.tmp_input = None
@@ -123,6 +125,66 @@ class BlockReconstructor(QuantCalibrator):
         for _, module in block.named_modules():
             if hasattr(module, 'mode'):
                 module.mode = mode
+
+    def get_block_k(self, name):
+        """
+        Layered dynamic rank for Fisher low-rank approximation.
+        Assigns higher k to earlier/deeper layers where accurate Fisher
+        estimation matters more, and lower k to later/shallower layers.
+
+        Tiere 1 (input + deep blocks 0-2):  k = min(self.k + 3, 12)
+        Tiere 2 (middle blocks 3-8):       k = self.k (global default, e.g. 5)
+        Tiere 3 (shallow blocks 9+):       k = self.k (same as middle)
+        Tiere 4 (head):                     k = max(self.k - 2, 1)
+
+        For 3-bit: pass --k 8 to shift all tiers up (12, 8, 8, 6).
+        """
+        if not self.adaptive_k:
+            return self.k
+        if 'patch_embed' in name:
+            return min(self.k + 3, 12)
+        # Extract block index for transformer blocks
+        import re
+        m = re.search(r'blocks\.(\d+)', name)
+        if m:
+            idx = int(m.group(1))
+            if idx <= 2:
+                return min(self.k + 3, 12)   # Deep layers: higher rank
+            elif idx <= 8:
+                return self.k                  # Middle layers: default
+            else:
+                return self.k                  # Shallow layers: default
+        if 'head' in name:
+            return max(self.k - 2, 1)         # Classification head: lower rank
+        return self.k
+
+    def compute_adaptive_p1p2(self, block):
+        """
+        Adaptive p1/p2 weights based on per-block activation std.
+        Uses absolute thresholds calibrated for ViT activation ranges.
+
+        ViT activations exhibit natural depth decay: early blocks (0-3)
+        have std ~2-4, later blocks (9-11) have std ~0.5-1.5.
+
+        - High variance (std > 2.5): increase low-rank term (p1↑, p2↓)
+          Richer channel correlations → Fisher low-rank is more informative.
+        - Normal (1.0 < std <= 2.5): keep default (p1=p2=base)
+        - Low variance (std <= 1.0): increase diagonal term (p1↓, p2↑)
+          Less channel structure → per-channel diag weighting is more stable.
+
+        Returns (p1, p2) tuple.
+        """
+        if not self.adaptive_p:
+            return self.p1, self.p2
+        if block.raw_out is None:
+            return self.p1, self.p2
+        block_std = block.raw_out.std().item()
+        if block_std > 2.5:
+            return self.p1 * 1.3, self.p2 * 0.7
+        elif block_std > 1.0:
+            return self.p1, self.p2
+        else:
+            return self.p1 * 0.7, self.p2 * 1.3
 
     def replace_block(self, target_block, new_block):
         self._replace_block_recursive(self.model, target_block, new_block)
@@ -313,10 +375,21 @@ class BlockReconstructor(QuantCalibrator):
         w_optimizer = torch.optim.Adam(w_params)
         a_optimizer = torch.optim.Adam(a_params, lr=lr) if len(a_params) != 0 else None
         a_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(a_optimizer, T_max=iters, eta_min=0.) if len(a_params) != 0 else None
-        loss_func = LossFunction(block, round_loss='relaxation', weight=weight, max_count=iters, 
+
+        # --- Dynamic k and adaptive p1/p2 ---
+        block_k = self.get_block_k(name)
+        block_p1, block_p2 = self.compute_adaptive_p1p2(block)
+        if self.adaptive_k:
+            logging.info('Block {} dynamic k={} (base k={})'.format(name, block_k, self.k))
+        if self.adaptive_p:
+            block_std = block.raw_out.std().item() if block.raw_out is not None else 0.0
+            logging.info('Block {} adaptive p1={:.2f}, p2={:.2f} (std={:.4f})'
+                         .format(name, block_p1, block_p2, block_std))
+
+        loss_func = LossFunction(block, round_loss='relaxation', weight=weight, max_count=iters,
                                  rec_loss=self.metric if 'head' not in name else 'kl_div',
-                                 b_range=b_range, decay_start=0, warmup=warmup, p1=self.p1, p2=self.p2)
-        i_change = math.floor(iters / self.k)
+                                 b_range=b_range, decay_start=0, warmup=warmup, p1=block_p1, p2=block_p2)
+        i_change = math.floor(iters / block_k)
         for it in range(iters):
             idx = torch.randperm(block.raw_input.size(0))[:batch_size]
             if mode == 'qdrop':
@@ -336,7 +409,7 @@ class BlockReconstructor(QuantCalibrator):
                         self.new_fisher_ro(block, device)
                         loss_func.update_fisher = True
                 elif self.dis_mode in ['qf']:
-                    if it in range(self.k):
+                    if it in range(block_k):
                         self.new_fisher_ro(block, device)
                         loss_func.update_fisher = True
                 cur_grad = block.raw_grad.to(device)

@@ -101,8 +101,23 @@ class PTQSLQuantLinear(MinMaxQuantLinear):
             grads = raw_grad if raw_grad is not None else getattr(self, 'fisher_grad', None)
             if grads is not None:
                 grads = grads.to(tensor_raw.device)
-                if grads.dim() == 1:
-                    grads = grads.view(1, -1)
+                # Reshape grad's trailing out_features dim to match tensor_raw's layout.
+                # tensor_raw may be (..., out_features) or (..., n_V, crb_rows) or
+                # (..., 1, n_V, crb_rows) depending on caller.  Find the trailing dims
+                # whose product equals out_features, reshape, then insert any remaining
+                # singleton dims just before that trailing group.
+                out_feat = grads.shape[-1]
+                trailing = []
+                p = 1
+                for d in reversed(tensor_raw.shape):
+                    trailing.insert(0, d)
+                    p *= d
+                    if p == out_feat:
+                        break
+                grads = grads.reshape(*grads.shape[:-1], *trailing)
+                # Insert any missing singleton dims right before the trailing group
+                while grads.ndim < tensor_raw.ndim:
+                    grads = grads.unsqueeze(grads.ndim - len(trailing))
                 similarity = -(tensor_raw - tensor_sim) ** 2 * grads.abs()
             else:
                 similarity = -(tensor_raw - tensor_sim) ** 2  # fallback to MSE

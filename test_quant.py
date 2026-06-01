@@ -109,6 +109,14 @@ def get_args_parser():
     parser.add_argument('--p2', type=float, default=argparse.SUPPRESS, help='The proportion of diag')
     parser.add_argument('--dis-mode', type=str, default=argparse.SUPPRESS, choices=['q','qf'],
                         help='the mode of getting gradient. `q`: use quantization; `qf` Take the first k times (default:Uniformly obtain k times);')
+    parser.add_argument('--adaptive-k', action='store_true', default=argparse.SUPPRESS,
+                        help='Enable layered dynamic Fisher rank (k varies by block depth)')
+    parser.add_argument('--adaptive-p', action='store_true', default=argparse.SUPPRESS,
+                        help='Enable adaptive p1/p2 weights based on activation std')
+    parser.add_argument('--no-adaptive-k', action='store_true', default=argparse.SUPPRESS,
+                        help='Disable layered dynamic Fisher rank (use global k for all blocks)')
+    parser.add_argument('--no-adaptive-p', action='store_true', default=argparse.SUPPRESS,
+                        help='Disable adaptive p1/p2 weights (use global p1/p2 for all blocks)')
     parser.add_argument('--pct', type=float, default=argparse.SUPPRESS,
                         help='clamp percentile of mlp.fc2 input for GELU clamping.')
     return parser
@@ -119,6 +127,8 @@ def seed_all(seed):
     np.random.seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def get_cur_time():
@@ -196,6 +206,17 @@ def main(args):
     cfg.p1 = args.p1 if hasattr(args, 'p1') else cfg.p1
     cfg.p2 = args.p2 if hasattr(args, 'p2') else cfg.p2
     cfg.dis_mode = args.dis_mode if hasattr(args, 'dis_mode') else cfg.dis_mode
+    # Adaptive k/p controls: --no-adaptive-k disables, --adaptive-k enables
+    cfg.adaptive_k = True  # default enabled
+    if hasattr(args, 'no_adaptive_k'):
+        cfg.adaptive_k = False
+    elif hasattr(args, 'adaptive_k'):
+        cfg.adaptive_k = True
+    cfg.adaptive_p = True  # default enabled
+    if hasattr(args, 'no_adaptive_p'):
+        cfg.adaptive_p = False
+    elif hasattr(args, 'adaptive_p'):
+        cfg.adaptive_p = True
     for name, value in vars(cfg).items():
         logging.info(f"{name}: {value}")
 
@@ -337,10 +358,15 @@ def main(args):
         block_reconstructor = BlockReconstructor(
             model, cfg.optim_batch_size, calib_loader,
             metric=cfg.optim_metric, temp=cfg.temp,
-            k=cfg.k, dis_mode=cfg.dis_mode, p1=cfg.p1, p2=cfg.p2
+            k=cfg.k, dis_mode=cfg.dis_mode, p1=cfg.p1, p2=cfg.p2,
+            adaptive_k=cfg.adaptive_k, adaptive_p=cfg.adaptive_p
         )
-        # Share Fisher base if available (unified FIM framework)
-        if shared_raw_pred_softmaxs is not None:
+        # Share Fisher base if available (unified FIM framework).
+        # NOTE: Skip sharing when Fisher calibration was used — the Fisher-guided
+        # calibration already optimizes important channels, leaving little headroom
+        # for Fisher-DPLR block recon on those same channels (diminishing returns).
+        # Letting block_recon compute its own self-consistency softmaxs avoids this.
+        if shared_raw_pred_softmaxs is not None and cfg.calib_metric in ['mse', 'mae']:
             block_reconstructor.set_shared_raw_pred_softmaxs(shared_raw_pred_softmaxs)
         block_reconstructor.reconstruct_model(quant_act=True, mode=cfg.optim_mode, drop_prob=cfg.drop_prob, keep_gpu=cfg.keep_gpu)
         logging.info("{} - {} guided block reconstruction finished.".format(get_cur_time(), cfg.optim_metric))

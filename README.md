@@ -81,31 +81,51 @@ python test_quant.py \
 
 To isolate the contribution of each Fisher-guided stage:
 
-| Experiment | MR | Calibration | AdaRound | Description |
-|:----------:|:--:|:----------:|:--------:|:-----------:|
-| A (Baseline) | ✗ | MSE | Fisher-DPLR | FIMA-Q equivalent |
-| B (+Fisher-MR) | Fisher-Diag | MSE | Fisher-DPLR | Test MR gain |
-| C (+Fisher-Calib) | ✗ | Fisher-Diag | Fisher-DPLR | Test Calib gain |
-| D (Full SynFIM) | Fisher-Diag | Fisher-Diag | Fisher-DPLR | Full unified gain |
+| Experiment | MR | Calib | AdaRound | Adaptive | Description |
+|:----------:|:--:|:-----:|:--------:|:--------:|:-----------|
+| A (Baseline) | ✗ | MSE | Fisher-DPLR | ✗ | FIMA-Q equivalent |
+| B (+Fisher-MR) | Fisher-Diag | MSE | Fisher-DPLR | ✗ | Test MR gain |
+| C (+Fisher-Calib) | ✗ | Fisher-Diag | Fisher-DPLR | ✗ | Test Calib gain |
+| D (Full SynFIM) | Fisher-Diag | Fisher-Diag | Fisher-DPLR | ✗ | Full unified FIM |
+| E (+Adaptive) | ✗ | MSE | Fisher-DPLR | ✅ | Baseline + adaptive k/p |
+| F (SynFIM-Q Final) | Fisher-Diag | Fisher-Diag | Fisher-DPLR | ✅ | **All optimizations** |
+
+> **Note:** `adaptive_k` and `adaptive_p` are enabled by default in `fim_unified.py`.
+> Use `--no-adaptive-k --no-adaptive-p` to disable them for baseline experiments A-D.
 
 ```bash
-# A: Baseline (no MR, MSE calib, Fisher-DPLR AdaRound)
+# A: Baseline (no MR, MSE calib, Fisher-DPLR AdaRound, no adaptive)
 python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py \
-  --w_bit 4 --a_bit 4 --calib-metric mse --optim-metric fisher_dplr \
-  --calibrate --optimize --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
+  --w_bit 4 --a_bit 4 --calib-metric mse --calibrate --optimize \
+  --no-adaptive-k --no-adaptive-p \
+  --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
 
-# B: +Fisher-MR only
+# B: +Fisher-MR only (no adaptive)
 python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py \
   --w_bit 4 --a_bit 4 --reconstruct-mlp --recon-metric fisher_diag \
   --calib-metric mse --calibrate --optimize \
+  --no-adaptive-k --no-adaptive-p \
   --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
 
-# C: +Fisher-Calib only
+# C: +Fisher-Calib only (no adaptive)
 python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py \
   --w_bit 4 --a_bit 4 --calib-metric fisher_diag --calibrate --optimize \
+  --no-adaptive-k --no-adaptive-p \
   --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
 
-# D: Full SynFIM-Q (all three stages Fisher-guided)
+# D: Full unified FIM (no adaptive)
+python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py \
+  --w_bit 4 --a_bit 4 --reconstruct-mlp --recon-metric fisher_diag \
+  --calib-metric fisher_diag --calibrate --optimize \
+  --no-adaptive-k --no-adaptive-p \
+  --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
+
+# E: Baseline + adaptive k/p (no MR, MSE calib, Fisher-DPLR AdaRound)
+python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py \
+  --w_bit 4 --a_bit 4 --calib-metric mse --calibrate --optimize \
+  --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
+
+# F: Full SynFIM-Q (all stages Fisher-guided + adaptive k/p)
 python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py \
   --w_bit 4 --a_bit 4 --reconstruct-mlp --recon-metric fisher_diag \
   --calib-metric fisher_diag --calibrate --optimize \
