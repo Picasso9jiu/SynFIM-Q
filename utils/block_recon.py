@@ -143,19 +143,18 @@ class BlockReconstructor(QuantCalibrator):
             return self.k
         if 'patch_embed' in name:
             return min(self.k + 3, 12)
-        # Extract block index for transformer blocks
         import re
         m = re.search(r'blocks\.(\d+)', name)
         if m:
             idx = int(m.group(1))
             if idx <= 2:
-                return min(self.k + 3, 12)   # Deep layers: higher rank
+                return min(self.k + 3, 12)
             elif idx <= 8:
-                return self.k                  # Middle layers: default
+                return self.k
             else:
-                return self.k                  # Shallow layers: default
+                return self.k
         if 'head' in name:
-            return max(self.k - 2, 1)         # Classification head: lower rank
+            return max(self.k - 2, 1)
         return self.k
 
     def compute_adaptive_p1p2(self, block):
@@ -383,7 +382,7 @@ class BlockReconstructor(QuantCalibrator):
             logging.info('Block {} dynamic k={} (base k={})'.format(name, block_k, self.k))
         if self.adaptive_p:
             block_std = block.raw_out.std().item() if block.raw_out is not None else 0.0
-            logging.info('Block {} adaptive p1={:.2f}, p2={:.2f} (std={:.4f})'
+            logging.info('Block {} adaptive p1={:.2f} p2={:.2f} (std={:.4f})'
                          .format(name, block_p1, block_p2, block_std))
 
         loss_func = LossFunction(block, round_loss='relaxation', weight=weight, max_count=iters,

@@ -14,6 +14,9 @@ class Config:
         self.token_channel_wise = True
         self.eq_n = 128
         self.search_round = 3
+        # MLP reconstruction settings
+        self.recon_metric = 'fisher_diag'   # Fisher-guided MR
+        self.pct = 0.9999                   # GELU clamping percentile
         # optimization settings
         self.keep_gpu = True
         self.optim_metric = 'fisher_dplr'
@@ -23,6 +26,9 @@ class Config:
         self.p1 = 1.0
         self.p2 = 1.0
         self.dis_mode = 'q'
+        # Adaptive Fisher parameters
+        self.adaptive_k = True   # Layered dynamic rank
+        self.adaptive_p = True   # Adaptive p1/p2
         # qdrop settings
         self.optim_mode = 'qdrop'
         self.drop_prob = 0.5
