@@ -4,15 +4,23 @@
 
 > SynFIM-Q 融合了两篇 CVPR 2025 工作（APHQ-ViT 和 FIMA-Q），将**同一套 Fisher Information Matrix**贯穿三个量化阶段：**MLP 重建 → 校准 → 块重建（AdaRound）**。
 
+SynFIM-Q 并不是简单串联 APHQ-ViT 与 FIMA-Q。我们的核心思路是：Fisher 信息在 ViT PTQ 中既能提供有效的重要性度量，也可能在多个阶段重复作用于相同敏感通道，从而产生阶段竞争。因此，SynFIM-Q 进一步研究 **Fisher 应该注入到哪个阶段、以多强的方式注入、以及不同位宽下是否应该采用不同组合**。
+
+相较于两篇基础工作，SynFIM-Q 的主要扩展包括：
+- **相较于 APHQ-ViT**：将 MLP Reconstruction 中基于固定扰动的 Hessian 估计替换为 Fisher-guided 重要性建模，使 MLP 权重重建与后续 Fisher-DPLR AdaRound 使用一致的敏感性度量。
+- **相较于 FIMA-Q**：将 Fisher 信息从块重建阶段扩展到 scale/zero-point 校准阶段，并引入 Fisher-weighted Calibration，使校准过程优先保护对最终 loss 更敏感的输出维度。
+- **进一步的自适应优化**：在 Fisher-DPLR AdaRound 中加入分层动态 rank 与自适应 `p1/p2`，让不同深度 block 使用不同强度的低秩项/对角项约束。
+- **阶段协同与竞争分析**：通过 4-bit 与 3-bit 消融实验发现，最优策略不是全模块叠加，而是 bit-width-aware stage selection：4-bit 更适合 Fisher-Calib，3-bit 更适合 Fisher-MR + Adaptive Fisher-DPLR。
+
 ## 核心贡献
 
-1. **Fisher-guided MLP Reconstruction (MR)** — 用 DPLR-FIM（Diagonal + Probabilistic Low-Rank Fisher）替代 APHQ-ViT 中的扰动 Hessian，为 MLP 权重优化提供更合理的输出重要性度量。对 GELU 激活进行截断并用 ReLU 替换。
+1. **Fisher-guided MLP Reconstruction (MR)** — 用 Fisher 重要性替代 APHQ-ViT 中的扰动 Hessian，为 MLP 权重优化提供更一致的输出敏感性度量。对 GELU 激活进行截断并用 ReLU 近似，降低低比特下非线性激活的量化误差。
 
-2. **Fisher-weighted Calibration** — 将 scale/zero-point 搜索扩展为 Fisher 重要性加权。一次 KL 散度反向传播即可计算所有模块的 Fisher 梯度，避免了逐模块的前向传递。
+2. **Fisher-weighted Calibration** — 将 FIMA-Q 中主要用于块重建的 Fisher 信息前移到校准阶段，将 scale/zero-point 搜索扩展为 Fisher 重要性加权，优先保护对最终 loss 更敏感的通道。
 
-3. **自适应 Fisher 优化（Adaptive k/p）** — 分层动态 Fisher 秩（深层 block 用更高 rank）和自适应 p1/p2 权重（根据激活方差调整低秩项 vs 对角项权重）。
+3. **自适应 Fisher 优化（Adaptive k/p）** — 分层动态 Fisher 秩和自适应 `p1/p2` 权重，使不同深度 block 根据激活分布动态调整低秩项与对角项强度。
 
-4. **Bit-width-aware Fisher 注入策略** — 系统分析 Fisher 信息在 ViT PTQ 多阶段中的协同与竞争，并根据量化位宽选择更合适的 Fisher 注入阶段，而不是盲目叠加所有模块。
+4. **Bit-width-aware Fisher 注入策略** — 系统分析 Fisher 信息在 ViT PTQ 多阶段中的协同与竞争，并根据量化位宽选择更合适的 Fisher 注入阶段，而不是盲目叠加所有模块。4-bit 下 Fisher-Calib 最优，3-bit 下 Fisher-MR 与 Adaptive Fisher-DPLR 更互补。
 
 ### 架构：SynFIM-Q Pipeline
 
