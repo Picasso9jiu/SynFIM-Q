@@ -1,8 +1,8 @@
 # SynFIM-Q: Synergized Fisher Information Matrix for Vision Transformer PTQ
 
-**SynFIM-Q** 的官方 PyTorch 实现——统一的 Fisher Information Matrix 引导的 Vision Transformer 后训练量化（PTQ）框架。
+**SynFIM-Q** 的 PyTorch 实现——统一的 Fisher Information Matrix 引导的 Vision Transformer 后训练量化（PTQ）框架。
 
-> SynFIM-Q 融合了两篇 CVPR 2025 工作（APHQ-ViT 和 FIMA-Q），将**同一套 Fisher Information Matrix**贯穿三个量化阶段：**MLP 重建 → 校准 → 块重建（AdaRound）**。
+> SynFIM-Q 融合了两篇 CVPR 2025 工作（APHQ-ViT 和 FIMA-Q），围绕**统一的 Fisher Information Matrix**研究三个量化阶段：**MLP 重建 → 校准 → 块重建（AdaRound）**。
 
 SynFIM-Q 并不是简单串联 APHQ-ViT 与 FIMA-Q。我们的核心思路是：Fisher 信息在 ViT PTQ 中既能提供有效的重要性度量，也可能在多个阶段重复作用于相同敏感通道，从而产生阶段竞争。因此，SynFIM-Q 进一步研究 **Fisher 应该注入到哪个阶段、以多强的方式注入、以及不同位宽下是否应该采用不同组合**。
 
@@ -11,6 +11,11 @@ SynFIM-Q 并不是简单串联 APHQ-ViT 与 FIMA-Q。我们的核心思路是：
 - **相较于 FIMA-Q**：将 Fisher 信息从块重建阶段扩展到 scale/zero-point 校准阶段，并引入 Fisher-weighted Calibration，使校准过程优先保护对最终 loss 更敏感的输出维度。
 - **进一步的自适应优化**：在 Fisher-DPLR AdaRound 中加入分层动态 rank 与自适应 `p1/p2`，让不同深度 block 使用不同强度的低秩项/对角项约束。
 - **阶段协同与竞争分析**：通过 4-bit 与 3-bit 消融实验发现，最优策略不是全模块叠加，而是 bit-width-aware stage selection：4-bit 更适合 Fisher-Calib，3-bit 更适合 Fisher-MR + Adaptive Fisher-DPLR。
+
+**优势概览**：
+- 在 W4A4 DeiT-Tiny 上，Fisher-Calib 达到 67.20% Top-1，优于基础 PTQ 配置。
+- 在 W3A3 DeiT-Tiny 上，Fisher-MR + Adaptive Fisher-DPLR 达到 56.92% Top-1，相比 55.55% baseline 提升 +1.37%。
+- 相比单纯堆叠模块，bit-width-aware stage selection 能更清楚地区分不同位宽下的主要误差来源，避免 Fisher 信息在多个阶段重复优化同一敏感子空间。
 
 ## 核心贡献
 
@@ -46,7 +51,7 @@ FP 基线: 72.21% Top-1
 | A (Baseline) | ✗ | MSE | ✗ | ~66.8% | — |
 | B (+Fisher-MR) | ✅ | MSE | ✗ | 66.93% | +0.13% |
 | **C (+Fisher-Calib)** | ✗ | **Fisher** | ✗ | **67.20%** | **+0.40%** |
-| D (Full SynFIM) | ✅ | Fisher | ✗ | 66.55% | -0.25% |
+| D (MR + Fisher-Calib) | ✅ | Fisher | ✗ | 66.55% | -0.25% |
 | **E (+Adaptive)** | ✗ | MSE | ✅ | **67.14%** | **+0.34%** |
 | C+E (Fisher+Adaptive) | ✗ | Fisher | ✅ | 66.95% | +0.15% |
 
@@ -74,7 +79,7 @@ PTQ Baseline: 55.55% Top-1
 **关键发现**：
 - **MR 是 3-bit 的核心增益来源**：B3 相比 C3/E3 更稳定，说明低比特下先修正 MLP 非线性误差非常重要。
 - **Adaptive k/p 与 MR 互补**：B+E 在 B3 基础上进一步提升到 56.92%；仅启用 adaptive_k 的 B+adaptive_k 为 56.51%，说明动态秩和自适应 p1/p2 需要配合使用。
-- **Fisher-Calib 的收益主要体现在校准阶段**：D3 与 D3-no-share 的校准后精度高于 B3，但最终 Top-1 没有超过 B3/B+E，表明 Fisher-Calib 与后续 Fisher-DPLR AdaRound 仍存在阶段竞争。
+- **Fisher-Calib 的收益主要体现在校准阶段**：D3 校准后精度高于 B3，但最终 Top-1 没有超过 B3/B+E，表明 Fisher-Calib 与后续 Fisher-DPLR AdaRound 仍存在阶段竞争。
 
 ### 推荐配置
 
@@ -197,7 +202,7 @@ python test_quant.py --model deit_tiny --config ./configs/3bit/best.py \
   --no-adaptive-k --no-adaptive-p \
   --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
 
-# D3: Full SynFIM（MR + Fisher 校准 + Fisher-DPLR）
+# D3: MR + Fisher-Calib（诊断阶段竞争）
 python test_quant.py --model deit_tiny --config ./configs/3bit/best.py \
   --w_bit 3 --a_bit 3 --reconstruct-mlp --recon-metric fisher_diag \
   --calib-metric fisher_diag --calibrate --optimize \
@@ -215,7 +220,7 @@ python test_quant.py --model deit_tiny --config ./configs/3bit/best.py \
   --calib-metric mse --calibrate --optimize \
   --k 8 --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
 
-# F3: Full SynFIM-Q（所有优化 + Adaptive k/p, k=8）
+# F3: Full combination（用于消融诊断，不是当前推荐配置）
 python test_quant.py --model deit_tiny --config ./configs/3bit/best.py \
   --w_bit 3 --a_bit 3 --reconstruct-mlp --recon-metric fisher_diag \
   --calib-metric fisher_diag --calibrate --optimize \
@@ -225,7 +230,7 @@ python test_quant.py --model deit_tiny --config ./configs/3bit/best.py \
 ## 断点续跑
 
 ```bash
-# 加载校准 checkpoint，跳过校准直接跑 Block Reconstruction
+# 加载校准 checkpoint，跳过校准直接跑 Block Reconstruction（4-bit 示例；3-bit 替换 config 与位宽即可）
 python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py \
   --w_bit 4 --a_bit 4 --calib-metric fisher_diag \
   --load-calibrate-checkpoint ./checkpoints/quant_result/xxx/xxx.pth \
