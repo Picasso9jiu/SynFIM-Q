@@ -333,19 +333,46 @@ SynFIM-Q/
 
 ## 设计说明
 
+### 为什么不简单叠加所有 Fisher 模块？
+
+SynFIM-Q 的设计目标不是把 MR、Fisher-Calib 和 Fisher-DPLR AdaRound 全部无条件打开，而是研究 Fisher 信息在不同 PTQ 阶段的作用边界。实验表明，Fisher 引导会优先优化对最终 loss 更敏感的通道；当一个阶段已经充分修正这些通道后，后续阶段继续使用强 Fisher 约束可能出现收益饱和甚至目标竞争。
+
+因此，SynFIM-Q 采用 **bit-width-aware Fisher injection**：
+- **W4A4**：量化误差较小，Fisher-Calib 是最有效的轻量注入点。
+- **W3A3**：量化误差更大，MR 先修正 MLP 非线性误差，再由 Adaptive Fisher-DPLR 优化 rounding，二者更互补。
+
+这种阶段选择比“全模块叠加”更稳定，也更符合不同位宽下误差来源不同的事实。
+
 ### 为什么用 Fisher 引导 MLP 重建？
 
 APHQ-ViT 使用基于扰动（±1e-6）的 Hessian 来估计输出重要性。我们的 Fisher 方法：
-- 使用单次反向传播 + KL 散度 loss，与下游阶段的计算一致
-- 天然集成 DPLR-FIM：对角 Fisher 用于逐通道加权
+- 使用 KL 散度反向传播估计输出对最终预测分布的敏感性，与下游 Fisher-DPLR AdaRound 的目标保持一致。
+- 用 Fisher 重要性替代固定扰动 Hessian，使 MLP 的 `fc1/fc2/norm2` 优化更关注影响最终分类结果的输出维度。
+- 对 GELU 激活进行截断并用 ReLU 近似，降低低比特量化下非线性激活的极端值影响。
+
+在 W3A3 上，MR 是最稳定的增益来源，说明低比特 ViT PTQ 中 MLP 非线性误差是主要瓶颈之一。
 
 ### 为什么用 Fisher 加权校准？
 
-标准校准最小化原始输出和量化输出之间的 MSE。我们的 Fisher 加权变体用梯度幅度加权误差，优先保护对最终 loss 更重要的通道。
+标准校准最小化原始输出和量化输出之间的 MSE，对所有输出维度近似等权处理。Fisher-Calib 用梯度幅度加权 scale/zero-point 搜索中的输出误差，优先保护对最终 loss 更重要的通道。
+
+这一策略在 W4A4 上最有效：4-bit 量化误差相对有限，校准阶段已经能把关键通道调整到较优位置，因此后续继续叠加 MR 或强 Fisher-DPLR 的收益空间较小。
+
+在 W3A3 上，Fisher-Calib 也能提高校准阶段精度，但与后续 Fisher-DPLR AdaRound 的优化目标存在部分重叠，最终 Top-1 不如 MR + Adaptive k/p 稳定。
+
+### 为什么需要 Adaptive k/p？
+
+Fisher-DPLR 由低秩项和对角项共同描述输出敏感性。固定 rank 和固定 `p1/p2` 在所有层上使用同一强度，无法适应 ViT 不同 block 的激活分布差异。
+
+Adaptive k/p 做了两件事：
+- **Adaptive k**：早期 block 和 patch embedding 使用更高 Fisher rank，head 使用更低 rank，降低无效低秩估计。
+- **Adaptive p1/p2**：根据 block 输出标准差调整低秩项与对角项权重，高方差层更依赖低秩相关性，低方差层更依赖稳定的对角加权。
+
+3-bit 实验显示，仅启用 adaptive_k 的 B+adaptive_k 为 56.51%，低于完整 B+E 的 56.92%，说明动态 rank 和自适应 `p1/p2` 需要协同使用。
 
 ### 为什么 4-bit 下叠加无增益，而 3-bit 更依赖 MR + Adaptive？
 
-SynFIM-Q 的核心结论不是“所有 Fisher 模块全开一定最优”，而是 **bit-width-aware Fisher injection**：不同位宽下，最有效的 Fisher 注入阶段不同。
+4-bit 和 3-bit 的主要误差来源不同，因此最优 Fisher 注入阶段也不同。
 
 4-bit 量化误差本身有限。Fisher 校准已将最重要的通道优化到接近 FP，后续 Fisher-DPLR 优化在这些通道上的梯度接近零，AdaRound 难以进一步改进。
 
