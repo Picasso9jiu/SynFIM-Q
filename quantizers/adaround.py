@@ -70,7 +70,14 @@ class AdaRoundQuantizer(nn.Module):
 
     def get_hard_value(self, x):
         init_shape = x.shape
-        return ((torch.floor(x.reshape_as(self.alpha) / self.scale) + (self.alpha >= 0).float()) * self.scale).reshape(*init_shape)
+        x_int = torch.floor(x.reshape_as(self.alpha) / self.scale) + (self.alpha >= 0).float()
+        if self.sym:
+            x_quant = torch.clamp(x_int, -self.n_levels, self.n_levels - 1)
+            x_float_q = x_quant * self.scale
+        else:
+            x_quant = torch.clamp(x_int + self.zero_point, 0, 2 * self.n_levels - 1)
+            x_float_q = (x_quant - self.zero_point) * self.scale
+        return x_float_q.reshape(*init_shape)
 
     def __repr__(self):
         return f'{self.__class__.__name__}(n_bits={self.n_bits}, sym={self.sym}, channel_wise={self.channel_wise}, round_mode={self.round_mode})'

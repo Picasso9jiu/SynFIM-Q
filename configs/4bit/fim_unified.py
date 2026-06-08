@@ -29,6 +29,7 @@ class Config:
         # Adaptive Fisher parameters (SynFIM-Q optimizations)
         self.adaptive_k = True   # Layered dynamic rank (k+3 for early blocks, k-2 for head)
         self.adaptive_p = True   # Adaptive p1/p2 based on block activation std
+        self.logit_guard = True  # Full-model logits/confidence guard during block reconstruction
         # qdrop settings
         self.optim_mode = 'qdrop'
         self.drop_prob = 0.5

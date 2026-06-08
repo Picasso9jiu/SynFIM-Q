@@ -1,404 +1,199 @@
-# SynFIM-Q: Synergized Fisher Information Matrix for Vision Transformer PTQ
+# SynFIM-Q: Fisher-Calibrated Adaptive PTQ for Vision Transformers
 
-**SynFIM-Q** 的 PyTorch 实现——统一的 Fisher Information Matrix 引导的 Vision Transformer 后训练量化（PTQ）框架。
+SynFIM-Q is a PyTorch implementation for post-training quantization (PTQ) of Vision Transformers. The current main branch focuses on improving DeiT-Tiny W4A4 PTQ by combining two effective Fisher-based stages:
 
-> SynFIM-Q 融合了两篇 CVPR 2025 工作（APHQ-ViT 和 FIMA-Q），围绕**统一的 Fisher Information Matrix**研究三个量化阶段：**MLP 重建 → 校准 → 块重建（AdaRound）**。
+- **Fisher-Calib (C)**: Fisher-weighted scale/zero-point calibration.
+- **Adaptive Fisher-DPLR AdaRound (E)**: Fisher-DPLR block reconstruction with residual-aware adaptive `k/p` and a hybrid keep/revert guard.
 
-SynFIM-Q 并不是简单串联 APHQ-ViT 与 FIMA-Q。我们的核心思路是：Fisher 信息在 ViT PTQ 中既能提供有效的重要性度量，也可能在多个阶段重复作用于相同敏感通道，从而产生阶段竞争。因此，SynFIM-Q 进一步研究 **Fisher 应该注入到哪个阶段、以多强的方式注入、以及不同位宽下是否应该采用不同组合**。
+The project is built on top of the engineering ideas from APHQ-ViT and FIMA-Q, but the current effective contribution is not a direct stack of all modules. We found that naive stacking can reduce final ImageNet accuracy, even when each module works well alone. SynFIM-Q therefore adds an adaptive and guarded reconstruction strategy so that useful Fisher-DPLR updates are retained while harmful or overfitted updates are reverted.
 
-相较于两篇基础工作，SynFIM-Q 的主要扩展包括：
-- **相较于 APHQ-ViT**：将 MLP Reconstruction 中基于固定扰动的 Hessian 估计替换为 Fisher-guided 重要性建模，使 MLP 权重重建与后续 Fisher-DPLR AdaRound 使用一致的敏感性度量。
-- **相较于 FIMA-Q**：将 Fisher 信息从块重建阶段扩展到 scale/zero-point 校准阶段，并引入 Fisher-weighted Calibration，使校准过程优先保护对最终 loss 更敏感的输出维度。
-- **进一步的自适应优化**：在 Fisher-DPLR AdaRound 中加入分层动态 rank 与自适应 `p1/p2`，让不同深度 block 使用不同强度的低秩项/对角项约束。
-- **阶段协同与竞争分析**：通过 4-bit 与 3-bit 消融实验发现，最优策略不是全模块叠加，而是 bit-width-aware stage selection：4-bit 更适合 Fisher-Calib，3-bit 更适合 Fisher-MR + Adaptive Fisher-DPLR。
+## Highlights
 
-**优势概览**：
-- 在 W4A4 DeiT-Tiny 上，Fisher-Calib 达到 67.20% Top-1，优于基础 PTQ 配置。
-- 在 W3A3 DeiT-Tiny 上，Fisher-MR + Adaptive Fisher-DPLR 达到 56.92% Top-1，相比 55.55% baseline 提升 +1.37%。
-- 相比单纯堆叠模块，bit-width-aware stage selection 能更清楚地区分不同位宽下的主要误差来源，避免 Fisher 信息在多个阶段重复优化同一敏感子空间。
+- **Fisher-weighted calibration**: moves Fisher sensitivity into the calibration stage, so quantization parameters protect dimensions that matter more to the final loss.
+- **Residual-aware adaptive `k/p`**: adjusts the Fisher low-rank rank `k` and the low-rank/diagonal weights `p1/p2` according to block residual statistics.
+- **Hybrid reconstruction guard**: combines local MSE, final reconstruction loss, and full-model logits/confidence signals to decide whether each block reconstruction should be kept or reverted.
+- **C+E synergy**: after guard correction, Fisher-Calib and Adaptive Fisher-DPLR improve together on DeiT-Tiny W4A4 instead of cancelling each other.
 
-## 核心贡献
+## Main Result
 
-1. **Fisher-guided MLP Reconstruction (MR)** — 用 Fisher 重要性替代 APHQ-ViT 中的扰动 Hessian，为 MLP 权重优化提供更一致的输出敏感性度量。对 GELU 激活进行截断并用 ReLU 近似，降低低比特下非线性激活的量化误差。
+Dataset: ImageNet validation set
 
-2. **Fisher-weighted Calibration** — 将 FIMA-Q 中主要用于块重建的 Fisher 信息前移到校准阶段，将 scale/zero-point 搜索扩展为 Fisher 重要性加权，优先保护对最终 loss 更敏感的通道。
+Model: DeiT-Tiny
 
-3. **自适应 Fisher 优化（Adaptive k/p）** — 分层动态 Fisher 秩和自适应 `p1/p2` 权重，使不同深度 block 根据激活分布动态调整低秩项与对角项强度。
+Full precision reference: about 72.21% Top-1
 
-4. **Bit-width-aware Fisher 注入策略** — 系统分析 Fisher 信息在 ViT PTQ 多阶段中的协同与竞争，并根据量化位宽选择更合适的 Fisher 注入阶段，而不是盲目叠加所有模块。4-bit 下 Fisher-Calib 最优，3-bit 下 Fisher-MR 与 Adaptive Fisher-DPLR 更互补。
+### W4A4 DeiT-Tiny
 
-### 架构：SynFIM-Q Pipeline
+| Setting | Calibration | Block Reconstruction | Guard | Top-1 | Top-5 | Loss |
+|---|---|---|---|---:|---:|---:|
+| Baseline PTQ | MSE | Fisher-DPLR | MSE guard | about 66.8 | - | - |
+| C only | Fisher-Calib | Fisher-DPLR | no adaptive k/p | 67.198 | 88.258 | 1.518 |
+| Previous C+E best | Fisher-Calib | Adaptive Fisher-DPLR | MSE guard | 67.176 | 88.194 | 1.477 |
+| Failed C+E variant | Fisher-Calib | Adaptive Fisher-DPLR | over-sensitive logits guard | 66.646 | 87.936 | 1.495 |
+| **SynFIM-Q C+E5** | **Fisher-Calib** | **Adaptive Fisher-DPLR** | **hybrid guard** | **67.364** | **88.530** | **1.474** |
 
-```
-   ┌──────────────┐    ┌───────────────┐    ┌──────────────────────────┐
-   │  Stage 0:    │    │  Stage 1:     │    │  Stage 2:                │
-   │  Fisher-MR   │───▶│  Fisher-Calib │───▶│  Fisher-AdaRound         │
-   │              │    │               │    │  + Adaptive k/p          │
-   │  • GELU→ReLU │    │  • Fisher-grad│    │  • AdaRound opt          │
-   │  • fc1,fc2,  │    │    weighted   │    │  • QDrop reg             │
-   │    norm2 opt │    │    MSE search │    │  • DPLR loss             │
-   └──────────────┘    └───────────────┘    └──────────────────────────┘
-```
+The best current W4A4 result is from log `20260608_0813_C&E5`.
 
-## 实验结果
+Compared with C only, C+E5 improves:
 
-### 4-bit DeiT-Tiny (W4A4)
+- Top-1: `+0.166`
+- Top-5: `+0.272`
+- Loss: `1.518 -> 1.474`
 
-FP 基线: 72.21% Top-1
+This result changes the earlier conclusion: C and E can be stacked effectively, but only when the block reconstruction stage uses a guard that avoids both mid-layer under-retention and late-layer calibration overfitting.
 
-| 实验 | MR | 校准 | Adaptive k/p | Top-1 | Δ Baseline |
-|:----:|:--:|:---:|:------------:|:-----:|:----------:|
-| A (Baseline) | ✗ | MSE | ✗ | ~66.8% | — |
-| B (+Fisher-MR) | ✅ | MSE | ✗ | 66.93% | +0.13% |
-| **C (+Fisher-Calib)** | ✗ | **Fisher** | ✗ | **67.20%** | **+0.40%** |
-| D (MR + Fisher-Calib) | ✅ | Fisher | ✗ | 66.55% | -0.25% |
-| **E (+Adaptive)** | ✗ | MSE | ✅ | **67.14%** | **+0.34%** |
-| C+E (Fisher+Adaptive) | ✗ | Fisher | ✅ | 66.95% | +0.15% |
+## What Changed in C+E5
 
-**关键发现**：
-- **单独使用效果显著**：Fisher 校准 (+0.40%) 和 Adaptive k/p (+0.34%) 各自优于 Baseline
-- **叠加无增益**：4-bit 下多个 Fisher 优化叠加存在 diminishing returns，因为量化误差本身有限，优化头寸被第一个 Fisher 阶段消耗
-- **C（Fisher 校准）为 4-bit 最优方案**，无需 MR 和 Adaptive 即可达到 67.20%
+Earlier C+E experiments showed that validation-on-calibration accuracy was not a reliable proxy for final ImageNet accuracy. Some blocks improved calibration logits but hurt final accuracy; other blocks had tiny calibration Top-1 fluctuations but still improved reconstruction and final performance.
 
-### 3-bit DeiT-Tiny (W3A3)
+C+E5 uses the following policy:
 
-FP 基线: 72.21% Top-1
+- Keep useful mid-layer updates even when calibration Top-1 has small noise.
+- Revert clearly harmful updates when CE or confidence signals degrade.
+- Prevent late blocks (`blocks.9` to `blocks.11`) from bypassing MSE/loss stability just because calibration logits improve.
+- Keep the classifier head update when both local MSE and logits improve.
 
-PTQ Baseline: 55.55% Top-1
+In the best run, `patch_embed`, `blocks.0` to `blocks.9`, and `head` were kept, while `blocks.10` and `blocks.11` were reverted.
 
-| 实验 | MR | 校准 | Adaptive k/p | k | Top-1 | Δ Baseline | 关键结论 |
-|:----:|:--:|:---:|:------------:|:-:|:-----:|:----------:|:--------|
-| Baseline | ✗ | MSE | ✗ | 5 | 55.55% | — | 标准 3-bit PTQ 对照 |
-| B3 (+Fisher-MR) | ✅ | MSE | ✗ | 5 | 56.82% | +1.27% | MR 在 3-bit 下提供稳定增益 |
-| C3 (+Fisher-Calib) | ✗ | Fisher | ✗ | 5 | 56.40% | +0.85% | Fisher 校准单独有效，但弱于 MR |
-| D3 (MR + Fisher-Calib) | ✅ | Fisher | ✗ | 5 | 56.68% | +1.13% | 校准后精度提升，但后续重建存在收益抵消 |
-| E3 (+Adaptive) | ✗ | MSE | ✅ | 8 | 55.99% | +0.44% | Adaptive 单独不如 MR |
-| B+adaptive_k | ✅ | MSE | k only | 8 | 56.51% | +0.96% | 仅动态 k 不如完整 Adaptive k/p |
-| **B+E (推荐)** | ✅ | MSE | ✅ | 8 | **56.92%** | **+1.37%** | **3-bit 当前最佳：MR 与 Adaptive 互补** |
+## Method
 
-**关键发现**：
-- **MR 是 3-bit 的核心增益来源**：B3 相比 C3/E3 更稳定，说明低比特下先修正 MLP 非线性误差非常重要。
-- **Adaptive k/p 与 MR 互补**：B+E 在 B3 基础上进一步提升到 56.92%；仅启用 adaptive_k 的 B+adaptive_k 为 56.51%，说明动态秩和自适应 p1/p2 需要配合使用。
-- **Fisher-Calib 的收益主要体现在校准阶段**：D3 校准后精度高于 B3，但最终 Top-1 没有超过 B3/B+E，表明 Fisher-Calib 与后续 Fisher-DPLR AdaRound 仍存在阶段竞争。
+### 1. Fisher-Calib
 
-### 推荐配置
+Standard PTQ calibration searches quantization scale and zero-point by minimizing output MSE. Fisher-Calib reweights this search with Fisher sensitivity, so calibration prioritizes output dimensions that are more important to the final objective.
 
-SynFIM-Q 不默认把所有 Fisher 模块全部叠加，而是根据量化误差强度选择 Fisher 注入阶段：
-
-| 位宽 | 推荐策略 | 命令关键参数 | 说明 |
-|:---:|:--------|:------------|:-----|
-| W4A4 | Fisher-Calib | `--calib-metric fisher_diag --no-adaptive-k --no-adaptive-p` | 4-bit 误差较小，Fisher 校准是最有效的轻量注入点 |
-| W3A3 | Fisher-MR + Adaptive Fisher-DPLR | `--reconstruct-mlp --calib-metric mse --k 8` | 3-bit 误差更大，MR 与 Adaptive k/p 更互补 |
-
-## 环境准备
-
-- 克隆仓库：
+In this codebase, Fisher-Calib is enabled with:
 
 ```bash
-git clone https://github.com/Picasso9jiu/SynFIM-Q.git
-cd SynFIM-Q
+--calib-metric fisher_diag
 ```
 
-- 安装 PyTorch 和 [timm](https://github.com/huggingface/pytorch-image-models/tree/main)：
+### 2. Adaptive Fisher-DPLR AdaRound
+
+FIMA-Q uses a Fisher-DPLR approximation during block reconstruction. SynFIM-Q extends this stage with residual-aware adaptive parameters:
+
+- `k`: rank of the low-rank Fisher component.
+- `p1`: weight of the low-rank Fisher term.
+- `p2`: weight of the diagonal Fisher term.
+
+The implementation uses block residual statistics to decide whether a block should use stronger low-rank modeling. In the current best W4A4 setup, `p2` remains conservative because previous experiments showed that aggressive `p2` increases can hurt final accuracy.
+
+### 3. Hybrid Guard
+
+After each block reconstruction, the model decides whether to keep or revert the update.
+
+The guard checks:
+
+- local block MSE before/after reconstruction;
+- final reconstruction loss for sensitive late blocks;
+- full-model logits on the calibration set, including CE, Top-1, true-class probability, margin, and prediction flips.
+
+The guard is intentionally not a pure logits rule. Calibration-set logits are noisy and can overfit, so logits improvements do not automatically override local stability for late blocks.
+
+## Quick Start
+
+### Environment
 
 ```bash
 pip install torch torchvision timm
 ```
 
-- 预训练 ViT 权重可通过 timm 直接加载，或下载到本地：
+Prepare ImageNet validation data, for example:
 
-```bash
-wget https://github.com/GoatWu/AdaLog/releases/download/v1.0/deit_tiny_patch16_224.bin
-mkdir -p ./checkpoints/vit_raw/
-mv deit_tiny_patch16_224.bin ./checkpoints/vit_raw/
-```
-
-## 数据集
-
-ImageNet (ILSVRC2012) 验证集。默认路径：
-```
+```text
 D:/AI/IaS-ViT-main/dataset/imagenet/val/
 ```
-可通过 `--dataset /path/to/imagenet` 覆盖。
 
-## 快速开始
+### Run the Current W4A4 C+E Pipeline
 
-### 4-bit DeiT-Tiny 推荐流程
-
-```bash
-# Fisher 校准 + Fisher-DPLR AdaRound（4-bit 推荐配置：禁用 Adaptive k/p）
-python test_quant.py \
-  --model deit_tiny \
-  --config ./configs/4bit/fim_unified.py \
-  --w_bit 4 --a_bit 4 \
-  --calib-metric fisher_diag \
-  --calibrate --optimize \
-  --no-adaptive-k --no-adaptive-p \
-  --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
-```
-
-### 3-bit DeiT-Tiny 推荐流程
+From an existing Fisher-Calib checkpoint:
 
 ```bash
-# Fisher-MR + MSE 校准 + Adaptive Fisher-DPLR（3-bit 推荐配置）
-python test_quant.py \
-  --model deit_tiny \
-  --config ./configs/3bit/best.py \
-  --w_bit 3 --a_bit 3 \
-  --reconstruct-mlp --recon-metric fisher_diag \
-  --calib-metric mse \
-  --calibrate --optimize \
-  --k 8 \
-  --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
+python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py --dataset D:/AI/IaS-ViT-main/dataset/imagenet --load-calibrate-checkpoint checkpoints/quant_result/20260530_1051_C/deit_tiny_w4_a4_calibsize_128_fisher_diag.pth --optimize --w_bit 4 --a_bit 4 --calib-metric fisher_diag --optim-size 1024 --val-batch-size 64 --num-workers 0 --device cuda
 ```
 
-### 4-bit 消融实验
+From scratch:
 
 ```bash
-# A: Baseline（FIMA-Q 等价：无 MR，MSE 校准，Fisher-DPLR AdaRound）
-python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py \
-  --w_bit 4 --a_bit 4 --calib-metric mse --calibrate --optimize \
-  --no-adaptive-k --no-adaptive-p \
-  --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
-
-# B: +Fisher-MR only
-python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py \
-  --w_bit 4 --a_bit 4 --reconstruct-mlp --recon-metric fisher_diag \
-  --calib-metric mse --calibrate --optimize \
-  --no-adaptive-k --no-adaptive-p \
-  --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
-
-# C: +Fisher-Calib only（4-bit 最优）
-python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py \
-  --w_bit 4 --a_bit 4 --calib-metric fisher_diag --calibrate --optimize \
-  --no-adaptive-k --no-adaptive-p \
-  --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
-
-# E: Baseline + Adaptive k/p
-python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py \
-  --w_bit 4 --a_bit 4 --calib-metric mse --calibrate --optimize \
-  --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
+python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py --dataset D:/AI/IaS-ViT-main/dataset/imagenet --calibrate --optimize --w_bit 4 --a_bit 4 --calib-metric fisher_diag --optim-size 1024 --val-batch-size 64 --num-workers 0 --device cuda
 ```
 
-### 3-bit 消融实验
+### Reproduce C Only
 
 ```bash
-# A3: Baseline
-python test_quant.py --model deit_tiny --config ./configs/3bit/best.py \
-  --w_bit 3 --a_bit 3 --calib-metric mse --calibrate --optimize \
-  --no-adaptive-k --no-adaptive-p \
-  --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
-
-# B3: +Fisher-MR only
-python test_quant.py --model deit_tiny --config ./configs/3bit/best.py \
-  --w_bit 3 --a_bit 3 --reconstruct-mlp --recon-metric fisher_diag \
-  --calib-metric mse --calibrate --optimize \
-  --no-adaptive-k --no-adaptive-p \
-  --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
-
-# C3: +Fisher-Calib only
-python test_quant.py --model deit_tiny --config ./configs/3bit/best.py \
-  --w_bit 3 --a_bit 3 --calib-metric fisher_diag --calibrate --optimize \
-  --no-adaptive-k --no-adaptive-p \
-  --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
-
-# D3: MR + Fisher-Calib（诊断阶段竞争）
-python test_quant.py --model deit_tiny --config ./configs/3bit/best.py \
-  --w_bit 3 --a_bit 3 --reconstruct-mlp --recon-metric fisher_diag \
-  --calib-metric fisher_diag --calibrate --optimize \
-  --no-adaptive-k --no-adaptive-p \
-  --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
-
-# E3: Baseline + Adaptive k/p（k=8）
-python test_quant.py --model deit_tiny --config ./configs/3bit/best.py \
-  --w_bit 3 --a_bit 3 --calib-metric mse --calibrate --optimize \
-  --k 8 --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
-
-# B+E: Fisher-MR + Adaptive k/p（3-bit 当前推荐）
-python test_quant.py --model deit_tiny --config ./configs/3bit/best.py \
-  --w_bit 3 --a_bit 3 --reconstruct-mlp --recon-metric fisher_diag \
-  --calib-metric mse --calibrate --optimize \
-  --k 8 --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
-
-# F3: Full combination（用于消融诊断，不是当前推荐配置）
-python test_quant.py --model deit_tiny --config ./configs/3bit/best.py \
-  --w_bit 3 --a_bit 3 --reconstruct-mlp --recon-metric fisher_diag \
-  --calib-metric fisher_diag --calibrate --optimize \
-  --k 8 --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
+python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py --dataset D:/AI/IaS-ViT-main/dataset/imagenet --calibrate --optimize --w_bit 4 --a_bit 4 --calib-metric fisher_diag --optim-size 1024 --val-batch-size 64 --num-workers 0 --device cuda --no-adaptive-k --no-adaptive-p --no-logit-guard
 ```
 
-## 断点续跑
+## Useful Flags
 
-```bash
-# 加载校准 checkpoint，跳过校准直接跑 Block Reconstruction（4-bit 示例；3-bit 替换 config 与位宽即可）
-python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py \
-  --w_bit 4 --a_bit 4 --calib-metric fisher_diag \
-  --load-calibrate-checkpoint ./checkpoints/quant_result/xxx/xxx.pth \
-  --optimize --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
+| Flag | Meaning |
+|---|---|
+| `--calib-metric fisher_diag` | Enable Fisher-weighted calibration. |
+| `--adaptive-k` / `--no-adaptive-k` | Enable or disable adaptive Fisher rank. |
+| `--adaptive-p` / `--no-adaptive-p` | Enable or disable adaptive `p1/p2`. |
+| `--no-logit-guard` | Disable the full-model logits guard. |
+| `--logit-guard-batches N` | Evaluate logits guard on only the first `N` calibration batches. |
+| `--recon-block-start N` | Start block reconstruction from block `N`. |
+| `--recon-block-end N` | End block reconstruction at block `N`. |
+| `--skip-patch-embed` | Skip patch embedding reconstruction. |
+| `--skip-head` | Skip classifier head reconstruction. |
+| `--diagnose-residual-only` | Only diagnose residual Fisher statistics, without running reconstruction. |
 
-# 加载 Block Reconstruction checkpoint，直接测试
-python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py \
-  --w_bit 4 --a_bit 4 \
-  --load-optimize-checkpoint ./checkpoints/quant_result/xxx/xxx.pth \
-  --test-optimize-checkpoint --dataset "D:/AI/IaS-ViT-main/dataset/imagenet"
-```
+## Code Structure
 
-## 自适应 Fisher 优化
-
-### 1. 分层动态秩 (`adaptive_k=True`，默认启用)
-
-根据 block 深度分配不同的 Fisher 秩（k）：
-
-- **深层**（patch_embed, blocks 0-2）：`k_base + 3`（更丰富的 Fisher，最大 12）
-- **中层**（blocks 3-8）：`k_base`（默认值）
-- **Head**：`k_base - 2`（最小 1）
-
-3-bit 建议使用 `--k 8` 将各层上移。
-
-### 2. 自适应 p1/p2 权重 (`adaptive_p=True`，默认启用)
-
-根据每层激活标准差动态调整低秩项 vs 对角项权重：
-
-- **高方差**（std > 2.5）：`p1 × 1.3, p2 × 0.7` — 低秩项更重要
-- **正常**（1.0 < std ≤ 2.5）：`p1, p2` — 默认
-- **低方差**（std ≤ 1.0）：`p1 × 0.7, p2 × 1.3` — 对角项更稳定
-
-控制参数：
-
-```bash
---no-adaptive-k     # 禁用分层动态秩（全局使用 k）
---no-adaptive-p     # 禁用自适应 p1/p2（全局使用 p1/p2）
---k 8               # 调整基础 Fisher 秩
-```
-
-实验证明，在 3-bit DeiT-Tiny 上仅启用 adaptive_k 不如同时启用 adaptive_k 与 adaptive_p；完整 Adaptive k/p 与 Fisher-MR 组合达到当前最佳 56.92% Top-1。
-
-## 配置文件
-
-编辑 `configs/4bit/fim_unified.py` 或创建新文件：
-
-```python
-class Config:
-    def __init__(self):
-        # 校准
-        self.calib_size = 128
-        self.calib_batch_size = 32
-        self.calib_metric = 'mse'       # 'mse' | 'fisher_diag'
-        # 量化位宽
-        self.w_bit = 4
-        self.a_bit = 4
-        # Block Reconstruction
-        self.optim_size = 1024
-        self.optim_batch_size = 32
-        self.optim_metric = 'fisher_dplr'
-        self.temp = 20
-        # MLP Reconstruction
-        self.recon_metric = 'fisher_diag'
-        self.pct = 0.9999
-        # Fisher 参数（跨阶段共享）
-        self.k = 5
-        self.p1 = 1.0
-        self.p2 = 1.0
-        self.dis_mode = 'q'
-        # 自适应优化
-        self.adaptive_k = True
-        self.adaptive_p = True
-        # QDrop
-        self.optim_mode = 'qdrop'
-        self.drop_prob = 0.5
-```
-
-## 支持的模型
-
-- **ViT**: Tiny, Small, Base, Large (patch16_224)
-- **DeiT**: Tiny, Small, Base (patch16_224)
-- **Swin**: Tiny, Small, Base (patch4_window7_224), Base (patch4_window12_384)
-
-所有预训练权重通过 `timm` 获取或从 `./checkpoints/vit_raw/` 加载。
-
-## 代码结构
-
-```
+```text
 SynFIM-Q/
-├── test_quant.py              # 主入口（3 阶段 pipeline）
-├── configs/
-│   ├── 3bit/                  # 3-bit 量化配置
-│   ├── 4bit/                  # 4-bit 量化配置
-│   │   ├── best.py            # 标准 FIMA-Q 配置
-│   │   └── fim_unified.py     # ★ SynFIM-Q 统一配置
-│   └── 6bit/                  # 6-bit 量化配置
-├── utils/
-│   ├── mlp_recon.py           # ★ Fisher 引导的 MLP 重建
-│   ├── calibrator.py          # QuantCalibrator（Fisher 扩展）
-│   ├── block_recon.py         # BlockReconstructor + LossFunction（DPLR-FIM + Adaptive）
-│   ├── datasets.py            # ImageNet 数据加载器
-│   ├── wrap_net.py            # 模型包装（Linear/Conv/MatMul → Quant）
-│   └── test_utils.py          # 精度辅助函数
-├── quantizers/
-│   ├── uniform.py             # UniformQuantizer
-│   ├── adaround.py            # AdaRoundQuantizer
-│   └── logarithm.py           # Log2 quantizer
-└── quant_layers/
-    ├── linear.py              # QuantLinear 变体
-    ├── conv.py                # QuantConv2d
-    └── matmul.py              # QuantMatMul（Q@K, Attn@V）
+|-- test_quant.py                 # Main entry point
+|-- configs/
+|   |-- 3bit/
+|   |-- 4bit/
+|   |   |-- best.py
+|   |   `-- fim_unified.py        # Current SynFIM-Q config
+|   `-- 6bit/
+|-- utils/
+|   |-- calibrator.py             # Calibration and Fisher-Calib logic
+|   |-- block_recon.py            # Fisher-DPLR AdaRound, adaptive k/p, hybrid guard
+|   |-- mlp_recon.py              # Optional MLP reconstruction
+|   |-- datasets.py
+|   |-- wrap_net.py
+|   `-- test_utils.py
+|-- quantizers/
+|   |-- uniform.py
+|   |-- adaround.py
+|   `-- logarithm.py
+`-- quant_layers/
+    |-- linear.py
+    |-- conv.py
+    `-- matmul.py
 ```
 
-## 设计说明
+## Implementation Notes
 
-### 为什么不简单叠加所有 Fisher 模块？
+Recent fixes and additions include:
 
-SynFIM-Q 的设计目标不是把 MR、Fisher-Calib 和 Fisher-DPLR AdaRound 全部无条件打开，而是研究 Fisher 信息在不同 PTQ 阶段的作用边界。实验表明，Fisher 引导会优先优化对最终 loss 更敏感的通道；当一个阶段已经充分修正这些通道后，后续阶段继续使用强 Fisher 约束可能出现收益饱和甚至目标竞争。
+- fixed residual Fisher diagnosis so gradients are captured during quantized forward passes;
+- fixed asymmetric AdaRound hard-value reconstruction with `zero_point`;
+- added per-block final loss logging;
+- added selective block reconstruction controls;
+- added full-model logits/confidence guard;
+- changed logits guard from over-sensitive single-metric rejection to a hybrid policy that keeps useful mid-layer updates and prevents late-layer overfitting.
 
-因此，SynFIM-Q 采用 **bit-width-aware Fisher injection**：
-- **W4A4**：量化误差较小，Fisher-Calib 是最有效的轻量注入点。
-- **W3A3**：量化误差更大，MR 先修正 MLP 非线性误差，再由 Adaptive Fisher-DPLR 优化 rounding，二者更互补。
+## Relation to APHQ-ViT and FIMA-Q
 
-这种阶段选择比“全模块叠加”更稳定，也更符合不同位宽下误差来源不同的事实。
+SynFIM-Q is based on the observation that APHQ-ViT and FIMA-Q are complementary but not automatically compatible when directly stacked.
 
-### 为什么用 Fisher 引导 MLP 重建？
+- Compared with APHQ-ViT, this project focuses less on using MR as the main W4A4 contribution and instead uses Fisher-Calib plus adaptive Fisher-DPLR reconstruction as the current effective pipeline.
+- Compared with FIMA-Q, SynFIM-Q adds Fisher-weighted calibration, residual-aware adaptive `k/p`, and a guard mechanism that decides whether each reconstructed block should be retained.
 
-APHQ-ViT 使用基于扰动（±1e-6）的 Hessian 来估计输出重要性。我们的 Fisher 方法：
-- 使用 KL 散度反向传播估计输出对最终预测分布的敏感性，与下游 Fisher-DPLR AdaRound 的目标保持一致。
-- 用 Fisher 重要性替代固定扰动 Hessian，使 MLP 的 `fc1/fc2/norm2` 优化更关注影响最终分类结果的输出维度。
-- 对 GELU 激活进行截断并用 ReLU 近似，降低低比特量化下非线性激活的极端值影响。
+The current W4A4 result shows that the main issue is not whether Fisher information is useful, but where and how strongly it should be injected across PTQ stages.
 
-在 W3A3 上，MR 是最稳定的增益来源，说明低比特 ViT PTQ 中 MLP 非线性误差是主要瓶颈之一。
+## Citation
 
-### 为什么用 Fisher 加权校准？
-
-标准校准最小化原始输出和量化输出之间的 MSE，对所有输出维度近似等权处理。Fisher-Calib 用梯度幅度加权 scale/zero-point 搜索中的输出误差，优先保护对最终 loss 更重要的通道。
-
-这一策略在 W4A4 上最有效：4-bit 量化误差相对有限，校准阶段已经能把关键通道调整到较优位置，因此后续继续叠加 MR 或强 Fisher-DPLR 的收益空间较小。
-
-在 W3A3 上，Fisher-Calib 也能提高校准阶段精度，但与后续 Fisher-DPLR AdaRound 的优化目标存在部分重叠，最终 Top-1 不如 MR + Adaptive k/p 稳定。
-
-### 为什么需要 Adaptive k/p？
-
-Fisher-DPLR 由低秩项和对角项共同描述输出敏感性。固定 rank 和固定 `p1/p2` 在所有层上使用同一强度，无法适应 ViT 不同 block 的激活分布差异。
-
-Adaptive k/p 做了两件事：
-- **Adaptive k**：早期 block 和 patch embedding 使用更高 Fisher rank，head 使用更低 rank，降低无效低秩估计。
-- **Adaptive p1/p2**：根据 block 输出标准差调整低秩项与对角项权重，高方差层更依赖低秩相关性，低方差层更依赖稳定的对角加权。
-
-3-bit 实验显示，仅启用 adaptive_k 的 B+adaptive_k 为 56.51%，低于完整 B+E 的 56.92%，说明动态 rank 和自适应 `p1/p2` 需要协同使用。
-
-### 为什么 4-bit 下叠加无增益，而 3-bit 更依赖 MR + Adaptive？
-
-4-bit 和 3-bit 的主要误差来源不同，因此最优 Fisher 注入阶段也不同。
-
-4-bit 量化误差本身有限。Fisher 校准已将最重要的通道优化到接近 FP，后续 Fisher-DPLR 优化在这些通道上的梯度接近零，AdaRound 难以进一步改进。
-
-3-bit 下量化误差更大，MLP 非线性替换和低比特 rounding 误差同时放大。实验证明 MR 是最稳定的低比特修正项，而 Adaptive k/p 能在 MR 后继续改善 Fisher-DPLR AdaRound；相比之下，Fisher-Calib 虽能提高校准阶段精度，但与后续 Fisher-DPLR 存在一定阶段竞争。
-
-## 引用
+If you use this repository, please also cite the related works that this project builds on:
 
 ```bibtex
 @inproceedings{wu2025fimaq,
-  title={FIMA-Q: Post-Training Quantization for Vision Transformers by
-         Fisher Information Matrix Approximation},
-  author={Wu, Zhuguanyu and Wang, Shihe and Zhang, Jiayi and Chen, Jiaxin
-          and Wang, Yunhong},
+  title={FIMA-Q: Post-Training Quantization for Vision Transformers by Fisher Information Matrix Approximation},
+  author={Wu, Zhuguanyu and Wang, Shihe and Zhang, Jiayi and Chen, Jiaxin and Wang, Yunhong},
   booktitle={IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
   year={2025}
 }
@@ -406,8 +201,4 @@ Adaptive k/p 做了两件事：
 
 ## License
 
-详见 [LICENSE](LICENSE) 文件。
-
----
-
-*维护者：[Picasso9jiu](https://github.com/Picasso9jiu)*
+See [LICENSE](LICENSE).

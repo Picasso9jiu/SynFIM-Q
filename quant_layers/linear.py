@@ -211,7 +211,7 @@ class PTQSLBatchingQuantLinear(PTQSLQuantLinear):
             batch_similarities.append(similarities)
         batch_similarities = torch.cat(batch_similarities, dim=0).sum(dim=0, keepdim=False) # shape: (eq_n, n_V) or (eq_n, n_V, crb_rows)
         best_index = batch_similarities.argmax(dim=0).reshape(1, self.n_V, -1, 1) # shape: (1,n_V,1,1) or (1,n_V,crb_rows,1)
-        tmp_w_scale = torch.gather(weight_scale_candidates, dim=0, index=reshaped_best_index) # shape: (1,n_V*crb_rows,1)
+        tmp_w_scale = torch.gather(weight_scale_candidates, dim=0, index=best_index) # shape: (1,n_V*crb_rows,1)
         self.w_quantizer.scale.data.copy_(tmp_w_scale.squeeze(0))
         return best_index.squeeze(0) # shape: (n_V,crb_rows,1)
 

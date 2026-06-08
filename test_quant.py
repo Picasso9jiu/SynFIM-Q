@@ -119,6 +119,20 @@ def get_args_parser():
                         help='Disable adaptive p1/p2 weights (use global p1/p2 for all blocks)')
     parser.add_argument('--pct', type=float, default=argparse.SUPPRESS,
                         help='clamp percentile of mlp.fc2 input for GELU clamping.')
+    parser.add_argument('--diagnose-residual-only', action='store_true',
+                        help='Run calibration and block residual diagnostics, then exit before block reconstruction.')
+    parser.add_argument('--recon-block-start', type=int, default=None,
+                        help='Only reconstruct transformer blocks with index >= this value.')
+    parser.add_argument('--recon-block-end', type=int, default=None,
+                        help='Only reconstruct transformer blocks with index <= this value.')
+    parser.add_argument('--skip-patch-embed', action='store_true',
+                        help='Skip patch_embed during block reconstruction.')
+    parser.add_argument('--skip-head', action='store_true',
+                        help='Skip classifier head during block reconstruction.')
+    parser.add_argument('--no-logit-guard', action='store_true',
+                        help='Disable full-model logits/confidence guard for block reconstruction.')
+    parser.add_argument('--logit-guard-batches', type=int, default=None,
+                        help='Number of calibration batches used by the logits/confidence guard. Default: all optim batches.')
     return parser
 
 
@@ -206,17 +220,20 @@ def main(args):
     cfg.p1 = args.p1 if hasattr(args, 'p1') else cfg.p1
     cfg.p2 = args.p2 if hasattr(args, 'p2') else cfg.p2
     cfg.dis_mode = args.dis_mode if hasattr(args, 'dis_mode') else cfg.dis_mode
-    # Adaptive k/p controls: --no-adaptive-k disables, --adaptive-k enables
-    cfg.adaptive_k = True  # default enabled
+    # Adaptive k/p controls follow the config by default.
+    cfg.adaptive_k = getattr(cfg, 'adaptive_k', False)
     if hasattr(args, 'no_adaptive_k'):
         cfg.adaptive_k = False
     elif hasattr(args, 'adaptive_k'):
         cfg.adaptive_k = True
-    cfg.adaptive_p = True  # default enabled
+    cfg.adaptive_p = getattr(cfg, 'adaptive_p', False)
     if hasattr(args, 'no_adaptive_p'):
         cfg.adaptive_p = False
     elif hasattr(args, 'adaptive_p'):
         cfg.adaptive_p = True
+    cfg.logit_guard = getattr(cfg, 'logit_guard', True)
+    if args.no_logit_guard:
+        cfg.logit_guard = False
     for name, value in vars(cfg).items():
         logging.info(f"{name}: {value}")
 
@@ -269,6 +286,7 @@ def main(args):
     # Stage 0: Fisher-guided MLP Reconstruction (NEW — Unified FIM pipeline)
     # ================================================================
     shared_raw_pred_softmaxs = None  # Will be shared across stages
+    block_residual_stats = None
 
     if args.reconstruct_mlp:
         # Replace GELU with ReLU in the model's MLP blocks (keep full_model with GELU)
@@ -331,6 +349,17 @@ def main(args):
             model = load_model(model, args, device, mode='calibrate')
             if args.test_calibrate_checkpoint:
                 val_loss, val_prec1, val_prec5 = validate(val_loader, model, criterion, print_freq=args.print_freq, device=device)
+            if cfg.calib_metric == 'fisher_diag' and (cfg.adaptive_k or cfg.adaptive_p) and args.optimize:
+                residual_loader = g.calib_loader(num=cfg.calib_size, batch_size=cfg.calib_batch_size, seed=args.seed)
+                residual_calibrator = QuantCalibrator(
+                    model, residual_loader,
+                    calib_metric=cfg.calib_metric,
+                    temperature=cfg.temp
+                )
+                block_residual_stats = residual_calibrator.compute_block_residual_stats()
+                if args.diagnose_residual_only:
+                    logging.info('Residual diagnostics finished; exiting before block reconstruction.')
+                    return
         else:
             logging.info("{} - start {} guided calibration".format(get_cur_time(), cfg.calib_metric))
             calib_loader = g.calib_loader(num=cfg.calib_size, batch_size=cfg.calib_batch_size, seed=args.seed)
@@ -347,6 +376,16 @@ def main(args):
             save_model(model, args, cfg, mode='calibrate')
             logging.info('Validating after calibration ...')
             val_loss, val_prec1, val_prec5 = validate(val_loader, model, criterion, print_freq=args.print_freq, device=device)
+            if cfg.calib_metric == 'fisher_diag' and (cfg.adaptive_k or cfg.adaptive_p) and args.optimize:
+                residual_calibrator = QuantCalibrator(
+                    model, calib_loader,
+                    calib_metric=cfg.calib_metric,
+                    temperature=cfg.temp
+                )
+                block_residual_stats = residual_calibrator.compute_block_residual_stats()
+                if args.diagnose_residual_only:
+                    logging.info('Residual diagnostics finished; exiting before block reconstruction.')
+                    return
 
     # ================================================================
     # Stage 2: Block Reconstruction (DPLR-FIM AdaRound)
@@ -359,7 +398,10 @@ def main(args):
             model, cfg.optim_batch_size, calib_loader,
             metric=cfg.optim_metric, temp=cfg.temp,
             k=cfg.k, dis_mode=cfg.dis_mode, p1=cfg.p1, p2=cfg.p2,
-            adaptive_k=cfg.adaptive_k, adaptive_p=cfg.adaptive_p
+            adaptive_k=cfg.adaptive_k, adaptive_p=cfg.adaptive_p,
+            block_residual_stats=block_residual_stats,
+            logit_guard=cfg.logit_guard,
+            logit_guard_batches=args.logit_guard_batches,
         )
         # Share Fisher base if available (unified FIM framework).
         # NOTE: Skip sharing when Fisher calibration was used — the Fisher-guided
@@ -368,7 +410,16 @@ def main(args):
         # Letting block_recon compute its own self-consistency softmaxs avoids this.
         if shared_raw_pred_softmaxs is not None and cfg.calib_metric in ['mse', 'mae']:
             block_reconstructor.set_shared_raw_pred_softmaxs(shared_raw_pred_softmaxs)
-        block_reconstructor.reconstruct_model(quant_act=True, mode=cfg.optim_mode, drop_prob=cfg.drop_prob, keep_gpu=cfg.keep_gpu)
+        block_reconstructor.reconstruct_model(
+            quant_act=True,
+            mode=cfg.optim_mode,
+            drop_prob=cfg.drop_prob,
+            keep_gpu=cfg.keep_gpu,
+            block_start=args.recon_block_start,
+            block_end=args.recon_block_end,
+            skip_patch_embed=args.skip_patch_embed,
+            skip_head=args.skip_head,
+        )
         logging.info("{} - {} guided block reconstruction finished.".format(get_cur_time(), cfg.optim_metric))
         save_model(model, args, cfg, mode='optimize')
     if args.load_optimize_checkpoint:
