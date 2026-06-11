@@ -16,17 +16,18 @@ SynFIM-Q 是一个基于 PyTorch 的 Vision Transformer 后训练量化（Post-T
 
 | 方法 | 起点 | 块重构策略 | Top-1 | Top-5 | Loss | 日志 |
 |---|---|---|---:|---:|---:|---|
-| 实验 C | Fisher-Calib | 固定 `k=5, p1=p2=1` | 67.198 | 88.258 | 1.518 | `20260530_1051_C` |
-| 当前代码 fixed 对照 | 同一 Fisher-Calib checkpoint | 固定 `k=5, p1=p2=1` | 67.304 | 88.328 | 1.472 | `20260610_1552` |
-| 旧版直接 adaptive | 同一 Fisher-Calib checkpoint | 全层直接 adaptive `k/p` | 67.282 | - | - | `20260610_1900` |
-| **SynFIM-Q** | 同一 Fisher-Calib checkpoint | **fixed/adaptive 候选选择** | **67.414** | 88.302 | 1.476 | `20260610_2256` |
+| 实验 A / Baseline | MSE-Calib | 固定 `k=5, p1=p2=1` | 66.800 | - | - | - |
+| 实验 B | Fisher-Calib | 固定 `k=5, p1=p2=1` | 67.198 | 88.258 | 1.518 | `20260530_1051_C` |
+| 实验 C | MSE-Calib | 纯 Adaptive `k/p` | - | - | - | 待跑 |
+| 实验 D / **SynFIM-Q** | Fisher-Calib | **Adaptive `k/p`** | **67.414** | 88.302 | 1.476 | `20260610_2256` |
 
 主要结论：
 
-- 相比历史实验 C，SynFIM-Q 提升 `+0.216 Top-1`。
-- 在同代码、同 checkpoint 的严格对照下，adaptive 候选选择相比 fixed `k/p` 提升 `+0.110 Top-1`。
-- 直接全层 adaptive 并不稳定，校准集指标或局部 MSE 的改善不能完全代表最终 ImageNet 精度提升。
-- 当前更有效的做法是把 fixed `k/p` 作为稳定锚点，只在候选评分明确更优的 block 上采用 adaptive 更新。
+- 相比实验 A / Baseline，SynFIM-Q 提升 `+0.614 Top-1`。
+- 相比实验 B，SynFIM-Q 进一步提升 `+0.216 Top-1`。
+- 实验结果说明，Fisher-Calib 可以提供更稳定的校准起点，而 adaptive `k/p` 可以在块重构阶段继续降低任务相关量化误差。
+- 实验 C 用于单独评估纯 adaptive `k/p` 模块，目前结果待补充。
+- 当前更有效的做法不是全层统一增强 Fisher 项，而是根据 block 级统计和分类一致性自适应决定 Fisher-DPLR 参数。
 
 ## 方法动机
 
@@ -51,7 +52,7 @@ SynFIM-Q 当前采用的思路是：保留 Fisher-Calib 作为稳定校准基础
 --calib-metric fisher_diag
 ```
 
-在当前主实验中，Fisher-Calib 先生成一个校准后的 checkpoint，后续 fixed 对照和 SynFIM-Q 都加载同一个 checkpoint，从而保证比较公平。
+在当前主实验中，Fisher-Calib 先生成一个校准后的 checkpoint，后续实验 B 和实验 D 都加载同一个 checkpoint，从而保证比较公平。
 
 ### 2. Fisher-DPLR 块重构
 
@@ -67,17 +68,17 @@ Loss_rec = p1 * Loss_low-rank + p2 * Loss_diag
 - `p1` 控制低秩项权重。
 - `p2` 控制对角项权重。
 
-实验 C 使用固定参数：
+实验 B 使用固定参数：
 
 ```text
 k = 5, p1 = 1.0, p2 = 1.0
 ```
 
-这一路线是当前 adaptive 方法的主要对照组。
+这一路线是当前 adaptive 方法的固定参数基准。
 
 ### 3. Adaptive `k/p`
 
-实验 E 对 Fisher-DPLR 的 `k/p` 进行自适应调整。当前实现会根据每个 block 的 residual 统计、相对误差信号和层位置，为不同 block 生成 adaptive 候选参数。
+实验 C 对 Fisher-DPLR 的 `k/p` 进行自适应调整。当前实现会根据每个 block 的 residual 统计、相对误差信号和层位置，为不同 block 生成 adaptive 候选参数。
 
 直观理解：
 
@@ -94,16 +95,16 @@ k = 5, p1 = 1.0, p2 = 1.0
 ```text
 对每个 block：
     1. 保存重构前 block 状态；
-    2. 构造 fixed 候选：k=5, p1=1, p2=1；
+    2. 构造固定参数候选：k=5, p1=1, p2=1；
     3. 构造 adaptive 候选：根据 residual 统计生成 k/p；
     4. 两个候选都从同一初始状态开始训练；
     5. 每个候选训练前恢复相同 RNG 状态；
     6. 分别计算局部 MSE、CE、true-class probability、logit margin 等指标；
-    7. adaptive 必须超过 fixed 一个 margin 才会被采用；
+    7. adaptive 必须超过固定参数候选一个 margin 才会被采用；
     8. 如果候选明显破坏 logits 或局部重构质量，则回退到重构前状态。
 ```
 
-这种设计的意义在于：adaptive 分支负责探索更优的 Fisher-DPLR 参数，fixed 分支负责提供稳定下界，guard 负责避免局部指标改善但最终分类退化。
+这种设计的意义在于：adaptive 分支负责探索更优的 Fisher-DPLR 参数，固定参数分支负责提供稳定参照，guard 负责避免局部指标改善但最终分类退化。
 
 ### 5. Logits Guard
 
@@ -115,7 +116,7 @@ k = 5, p1 = 1.0, p2 = 1.0
 - true-class logit margin；
 - 预测翻转情况。
 
-对明显损害后层分类一致性的候选，会执行回退；对局部 MSE 下降且 logits 明显改善的候选，则允许保留。这是当前 C+E 能稳定超过 fixed 对照的关键。
+对明显损害后层分类一致性的候选，会执行回退；对局部 MSE 下降且 logits 明显改善的候选，则允许保留。这是当前实验 D 能稳定超过实验 B 的关键。
 
 ## 与 APHQ-ViT 和 FIMA-Q 的关系
 
@@ -125,7 +126,7 @@ k = 5, p1 = 1.0, p2 = 1.0
 - 使用 Fisher-Calib 作为校准阶段的稳定基础；
 - 以 Fisher-DPLR AdaRound 作为块重构主体；
 - 在块重构中加入 residual-aware adaptive `k/p`；
-- 使用 fixed/adaptive 候选选择避免全层 adaptive 失效；
+- 使用固定参数与自适应参数的候选比较，避免全层 adaptive 失效；
 - 使用 MSE + logits guard 共同判断每个 block 的更新是否应保留。
 
 相较于原始实现，SynFIM-Q 的主要改进点可以概括为：**从固定全局 Fisher 超参数，扩展为具有候选比较和分类一致性约束的 block-wise Fisher 自适应策略。**
@@ -155,11 +156,31 @@ val/
 
 ## 实验命令
 
-下面命令均以 4bit DeiT-Tiny 为例。为了保证 fixed 对照和 SynFIM-Q 对比严谨，建议使用同一个 Fisher-Calib checkpoint。
+下面命令均以 4bit DeiT-Tiny 为例。为了保证实验 B 和实验 D 对比严谨，建议使用同一个 Fisher-Calib checkpoint。
 
-### 1. 生成 Fisher-Calib checkpoint
+### 1. 实验 A / Baseline：MSE-Calib + 固定 `k/p`
 
-该步骤对应实验 C 和 C+E 的共同起点：
+先生成普通 MSE-Calib checkpoint：
+
+```bash
+python test_quant.py --model deit_tiny --config ./configs/4bit/best.py --dataset D:/AI/IaS-ViT-main/dataset/imagenet --calibrate --w_bit 4 --a_bit 4 --calib-metric mse --val-batch-size 64 --num-workers 0 --device cuda
+```
+
+运行结束后，会在如下目录保存 checkpoint：
+
+```text
+checkpoints/quant_result/<timestamp>/deit_tiny_w4_a4_calibsize_128_mse.pth
+```
+
+然后加载该 checkpoint，关闭 adaptive `k/p` 和候选选择：
+
+```bash
+python test_quant.py --model deit_tiny --config ./configs/4bit/best.py --dataset D:/AI/IaS-ViT-main/dataset/imagenet --load-calibrate-checkpoint checkpoints/quant_result/<timestamp>/deit_tiny_w4_a4_calibsize_128_mse.pth --optimize --w_bit 4 --a_bit 4 --calib-metric mse --optim-metric fisher_dplr --optim-size 1024 --val-batch-size 64 --num-workers 0 --device cuda --no-adaptive-k --no-adaptive-p --no-adaptive-candidate-select --no-logit-bias-correction
+```
+
+### 2. 生成 Fisher-Calib checkpoint
+
+该步骤对应实验 B 和实验 D 的共同起点：
 
 ```bash
 python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py --dataset D:/AI/IaS-ViT-main/dataset/imagenet --calibrate --w_bit 4 --a_bit 4 --calib-metric fisher_diag --val-batch-size 64 --num-workers 0 --device cuda
@@ -173,7 +194,7 @@ checkpoints/quant_result/<timestamp>/deit_tiny_w4_a4_calibsize_128_fisher_diag.p
 
 README 中的日志目录只是本文实验记录，复现时请把 `<timestamp>` 替换为你本地实际生成的目录名。
 
-### 2. 实验 C：Fisher-Calib + 固定 `k/p`
+### 3. 实验 B：Fisher-Calib + 固定 `k/p`
 
 加载 Fisher-Calib checkpoint，关闭 adaptive `k/p` 和候选选择：
 
@@ -181,23 +202,13 @@ README 中的日志目录只是本文实验记录，复现时请把 `<timestamp>
 python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py --dataset D:/AI/IaS-ViT-main/dataset/imagenet --load-calibrate-checkpoint checkpoints/quant_result/<timestamp>/deit_tiny_w4_a4_calibsize_128_fisher_diag.pth --optimize --w_bit 4 --a_bit 4 --calib-metric fisher_diag --optim-size 1024 --val-batch-size 64 --num-workers 0 --device cuda --no-adaptive-k --no-adaptive-p --no-adaptive-candidate-select --no-logit-bias-correction
 ```
 
-该命令用于复现 fixed `k/p` 对照。它保留 Fisher-Calib 和 Fisher-DPLR AdaRound，但不启用 adaptive 参数。
+该命令用于复现实验 B。它保留 Fisher-Calib 和 Fisher-DPLR AdaRound，但不启用 adaptive 参数。
 
-### 3. 单独实验 E：MSE-Calib + Adaptive `k/p`
+### 4. 实验 C：MSE-Calib + 纯 Adaptive `k/p`
 
-如果要单独评估 adaptive `k/p` 模块，不引入 Fisher-Calib，需要先生成普通 MSE-Calib checkpoint：
+如果要单独评估 adaptive `k/p` 模块，不引入 Fisher-Calib，先使用实验 A 中生成的 MSE-Calib checkpoint。
 
-```bash
-python test_quant.py --model deit_tiny --config ./configs/4bit/best.py --dataset D:/AI/IaS-ViT-main/dataset/imagenet --calibrate --w_bit 4 --a_bit 4 --calib-metric mse --val-batch-size 64 --num-workers 0 --device cuda
-```
-
-生成的 checkpoint 路径通常为：
-
-```text
-checkpoints/quant_result/<timestamp>/deit_tiny_w4_a4_calibsize_128_mse.pth
-```
-
-然后加载该 MSE-Calib checkpoint，只启用 adaptive `k/p`：
+加载该 MSE-Calib checkpoint，只启用 adaptive `k/p`：
 
 ```bash
 python test_quant.py --model deit_tiny --config ./configs/4bit/best.py --dataset D:/AI/IaS-ViT-main/dataset/imagenet --load-calibrate-checkpoint checkpoints/quant_result/<timestamp>/deit_tiny_w4_a4_calibsize_128_mse.pth --optimize --w_bit 4 --a_bit 4 --calib-metric mse --optim-metric fisher_dplr --optim-size 1024 --val-batch-size 64 --num-workers 0 --device cuda --adaptive-k --adaptive-p --no-adaptive-candidate-select --logit-guard --no-logit-bias-correction
@@ -205,20 +216,21 @@ python test_quant.py --model deit_tiny --config ./configs/4bit/best.py --dataset
 
 说明：
 
-- 这条命令更接近“单独 E”的严格消融定义：只考察 adaptive `k/p` 在块重构阶段的作用。
-- 如果希望评估当前更稳健的 E 模块，可以把 `--no-adaptive-candidate-select` 改成 `--adaptive-candidate-select`，但这已经属于带候选选择和 guard 的增强版 E。
+- 这条命令用于纯 adaptive `k/p` 消融，只考察 adaptive `k/p` 在块重构阶段的作用。
+- 当前实验 C 结果还未补充，README 表格中暂时保留为空。
+- 如果希望评估更稳健的 adaptive 模块，可以把 `--no-adaptive-candidate-select` 改成 `--adaptive-candidate-select`，但这已经属于带候选选择和 guard 的增强版设置。
 
-### 4. C+E / SynFIM-Q：Fisher-Calib + Adaptive 候选选择
+### 5. 实验 D / SynFIM-Q：Fisher-Calib + Adaptive `k/p`
 
-加载与实验 C 相同的 Fisher-Calib checkpoint，启用当前最优的 adaptive 候选选择逻辑：
+加载与实验 B 相同的 Fisher-Calib checkpoint，启用当前最优的 adaptive 候选选择逻辑：
 
 ```bash
 python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py --dataset D:/AI/IaS-ViT-main/dataset/imagenet --load-calibrate-checkpoint checkpoints/quant_result/<timestamp>/deit_tiny_w4_a4_calibsize_128_fisher_diag.pth --optimize --w_bit 4 --a_bit 4 --calib-metric fisher_diag --optim-size 1024 --val-batch-size 64 --num-workers 0 --device cuda --adaptive-k --adaptive-p --adaptive-candidate-select --logit-guard --no-logit-bias-correction
 ```
 
-这是当前 README 中 SynFIM-Q 主结果使用的实验设置。
+这是当前 README 中 SynFIM-Q 主结果使用的实验设置，对应实验 D。
 
-### 5. 迁移到 3bit / 6bit
+### 6. 迁移到 3bit / 6bit
 
 自适应候选选择已经接入 `test_quant.py`，因此 3bit、6bit 不需要额外脚本，只需要更换 config、bit 参数和对应 checkpoint。
 
@@ -242,15 +254,15 @@ python test_quant.py --model deit_tiny --config ./configs/6bit/best.py --dataset
 | `--load-calibrate-checkpoint` | 加载已有 calibrated checkpoint，用于后续块重构。 |
 | `--optimize` | 执行块重构 / AdaRound 优化。 |
 | `--calib-metric fisher_diag` | 启用 Fisher-Calib。 |
-| `--calib-metric mse` | 使用普通 MSE 校准，适合单独 E 消融。 |
+| `--calib-metric mse` | 使用普通 MSE 校准，适合实验 A 和实验 C。 |
 | `--optim-metric fisher_dplr` | 使用 Fisher-DPLR 重构损失。 |
 | `--k` | 全局 Fisher 低秩 rank，默认主实验为 `5`。 |
 | `--p1` / `--p2` | 低秩项和对角项的全局权重。 |
 | `--adaptive-k` / `--no-adaptive-k` | 启用或关闭自适应 Fisher rank。 |
 | `--adaptive-p` / `--no-adaptive-p` | 启用或关闭自适应 `p1/p2`。 |
-| `--adaptive-candidate-select` | 启用 fixed/adaptive 候选选择。 |
+| `--adaptive-candidate-select` | 启用固定参数 / 自适应参数候选选择。 |
 | `--no-adaptive-candidate-select` | 关闭候选选择，直接按当前 `k/p` 逻辑重构。 |
-| `--adaptive-candidate-margin` | adaptive 候选超过 fixed 候选所需的分数 margin，默认 `0.003`。 |
+| `--adaptive-candidate-margin` | adaptive 候选超过固定参数候选所需的分数 margin，默认 `0.003`。 |
 | `--logit-guard` / `--no-logit-guard` | 启用或关闭 logits guard。 |
 | `--logit-guard-batches N` | 只用前 `N` 个校准 batch 做 logits guard。 |
 | `--logit-guard-size N` | 使用额外 held-out 校准样本做 logits guard；当前主结果使用默认 `0`。 |
@@ -310,18 +322,18 @@ SynFIM-Q/
 ## 当前实现要点
 
 - 校准集加载使用确定性随机种子，减少实验漂移。
-- fixed/adaptive 候选训练前会恢复相同 block 状态和 RNG 状态，保证对比公平。
+- 固定参数 / 自适应参数候选训练前会恢复相同 block 状态和 RNG 状态，保证对比公平。
 - adaptive `k/p` 从 residual 统计生成，固定 `k/p` 作为稳定锚点。
-- adaptive 候选必须超过 fixed 候选指定 margin 才会被采用。
+- adaptive 候选必须超过固定参数候选指定 margin 才会被采用。
 - 对明显损害 CE、置信度、logit margin 或 late-block 分类一致性的更新执行回退。
 - 块重构会记录每个 block 的最终 loss、MSE、logits guard 指标和候选选择结果，方便后续消融分析。
 
 ## 注意事项
 
 - 当前主结果以 Top-1 为主要指标；Top-5 和 Loss 不是所有历史实验中的最高值。
-- 候选选择会增加运行时间，因为部分 block 会分别训练 fixed 和 adaptive 两个候选。
-- 为了保证对比严谨，实验 C 和 C+E 应加载同一个 Fisher-Calib checkpoint。
-- 单独 E 消融建议加载 MSE-Calib checkpoint，避免 Fisher-Calib 对结果产生混淆。
+- 候选选择会增加运行时间，因为部分 block 会分别训练固定参数和自适应参数两个候选。
+- 为了保证对比严谨，实验 B 和实验 D 应加载同一个 Fisher-Calib checkpoint。
+- 实验 C 建议加载 MSE-Calib checkpoint，避免 Fisher-Calib 对纯 adaptive `k/p` 消融产生混淆。
 - 当前主结果使用 `--no-logit-bias-correction`，因为此前实验中该模块收益不稳定。
 - `checkpoints/` 已在 `.gitignore` 中忽略，仓库不会上传实验 checkpoint。
 
