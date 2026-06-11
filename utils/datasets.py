@@ -14,6 +14,7 @@ from PIL import Image
 from PIL import ImageFile
 import random
 import torch.nn.functional as F
+import logging
 from torch.utils.data import Dataset
 import timm
 from timm.models.vision_transformer import VisionTransformer
@@ -60,10 +61,32 @@ class LoaderGenerator():
         return torch.utils.data.DataLoader(self.val_set, batch_size=self.val_batch_size, shuffle=False, **self.val_loader_kwargs)
 
     def calib_loader(self, num=1024, batch_size=32, seed=3, in_memory=True):
-        np.random.seed(seed)
-        inds = np.random.permutation(len(self.train_set))[:num]
+        rng = np.random.RandomState(seed)
+        inds = rng.permutation(len(self.train_set))[:num]
         if in_memory:
-            preloaded_data = [self.train_set[i] for i in inds]
+            py_state = random.getstate()
+            np_state = np.random.get_state()
+            torch_state = torch.random.get_rng_state()
+            cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            transform_seed = int(seed + 1009 * num + 9173 * batch_size) % (2 ** 32 - 1)
+            logging.info(
+                'Building deterministic calib loader: num={} batch_size={} seed={} transform_seed={}'.format(
+                    num, batch_size, seed, transform_seed
+                )
+            )
+            random.seed(transform_seed)
+            np.random.seed(transform_seed)
+            torch.manual_seed(transform_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(transform_seed)
+            try:
+                preloaded_data = [self.train_set[i] for i in inds]
+            finally:
+                random.setstate(py_state)
+                np.random.set_state(np_state)
+                torch.random.set_rng_state(torch_state)
+                if cuda_states is not None:
+                    torch.cuda.set_rng_state_all(cuda_states)
             self._calib_set = CacheDataset(preloaded_data)
         else:
             self._calib_set = torch.utils.data.Subset(copy.deepcopy(self.train_set),inds)

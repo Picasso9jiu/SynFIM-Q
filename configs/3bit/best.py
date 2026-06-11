@@ -29,6 +29,9 @@ class Config:
         # Adaptive Fisher parameters
         self.adaptive_k = True   # Layered dynamic rank
         self.adaptive_p = True   # Adaptive p1/p2
+        self.adaptive_candidate_select = False
+        self.adaptive_candidate_margin = 0.003
+        self.logit_guard = True
         # qdrop settings
         self.optim_mode = 'qdrop'
         self.drop_prob = 0.5

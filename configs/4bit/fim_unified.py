@@ -27,8 +27,10 @@ class Config:
         self.p2 = 1.0
         self.dis_mode = 'q'
         # Adaptive Fisher parameters (SynFIM-Q optimizations)
-        self.adaptive_k = True   # Layered dynamic rank (k+3 for early blocks, k-2 for head)
-        self.adaptive_p = True   # Adaptive p1/p2 based on block activation std
+        self.adaptive_k = True   # Residual-aware rank selection around the auto/base k
+        self.adaptive_p = True   # Residual-aware DPLR low-rank/diagonal weighting
+        self.adaptive_candidate_select = True  # Select fixed/adaptive k,p candidates per block
+        self.adaptive_candidate_margin = 0.003 # Prefer fixed unless adaptive is clearly better
         self.logit_guard = True  # Full-model logits/confidence guard during block reconstruction
         # qdrop settings
         self.optim_mode = 'qdrop'

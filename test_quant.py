@@ -9,6 +9,7 @@ import importlib
 import timm
 import copy
 import time
+import torch.nn.functional as F
 
 import utils.datasets as mydatasets
 from utils.calibrator import QuantCalibrator
@@ -117,6 +118,13 @@ def get_args_parser():
                         help='Disable layered dynamic Fisher rank (use global k for all blocks)')
     parser.add_argument('--no-adaptive-p', action='store_true', default=argparse.SUPPRESS,
                         help='Disable adaptive p1/p2 weights (use global p1/p2 for all blocks)')
+    adaptive_candidate_group = parser.add_mutually_exclusive_group()
+    adaptive_candidate_group.add_argument('--adaptive-candidate-select', action='store_true', default=argparse.SUPPRESS,
+                                          help='Enable fixed/adaptive per-block candidate selection.')
+    adaptive_candidate_group.add_argument('--no-adaptive-candidate-select', action='store_true', default=argparse.SUPPRESS,
+                                          help='Disable fixed/adaptive per-block candidate selection.')
+    parser.add_argument('--adaptive-candidate-margin', type=float, default=None,
+                        help='Score margin required for adaptive candidate to beat fixed candidate.')
     parser.add_argument('--pct', type=float, default=argparse.SUPPRESS,
                         help='clamp percentile of mlp.fc2 input for GELU clamping.')
     parser.add_argument('--diagnose-residual-only', action='store_true',
@@ -129,14 +137,33 @@ def get_args_parser():
                         help='Skip patch_embed during block reconstruction.')
     parser.add_argument('--skip-head', action='store_true',
                         help='Skip classifier head during block reconstruction.')
-    parser.add_argument('--no-logit-guard', action='store_true',
-                        help='Disable full-model logits/confidence guard for block reconstruction.')
+    logit_guard_group = parser.add_mutually_exclusive_group()
+    logit_guard_group.add_argument('--logit-guard', action='store_true', default=argparse.SUPPRESS,
+                                   help='Enable full-model logits/confidence guard for block reconstruction.')
+    logit_guard_group.add_argument('--no-logit-guard', action='store_true', default=argparse.SUPPRESS,
+                                   help='Disable full-model logits/confidence guard for block reconstruction.')
     parser.add_argument('--logit-guard-batches', type=int, default=None,
                         help='Number of calibration batches used by the logits/confidence guard. Default: all optim batches.')
+    parser.add_argument('--logit-guard-size', type=int, default=0,
+                        help='Number of held-out calibration samples used by the logits/confidence guard. Default 0 reuses optim samples.')
+    parser.add_argument('--logit-guard-seed-offset', type=int, default=1009,
+                        help='Seed offset for held-out logit guard samples.')
+    parser.add_argument('--no-logit-bias-correction', action='store_true',
+                        help='Disable guarded teacher-logit bias correction after block reconstruction.')
+    parser.add_argument('--bias-correction-size', type=int, default=512,
+                        help='Number of samples used to estimate the post-reconstruction head bias correction.')
+    parser.add_argument('--bias-correction-guard-size', type=int, default=512,
+                        help='Number of held-out samples used to keep/revert head bias correction.')
+    parser.add_argument('--bias-correction-seed-offset', type=int, default=2029,
+                        help='Seed offset for head bias correction samples.')
+    parser.add_argument('--bias-correction-max-abs', type=float, default=0.08,
+                        help='Maximum absolute logit bias correction per class.')
     return parser
 
 
 def seed_all(seed):
+    import random
+    random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
     torch.cuda.manual_seed(seed)
@@ -166,11 +193,13 @@ def save_model(model, args, cfg, mode='calibrate'):
 
     logging.info(f"Saving checkpoint to {save_path}")
     torch.save(model.state_dict(), save_path)
+    return save_path
 
 
-def load_model(model, args, device, mode='calibrate'):
+def load_model(model, args, device, mode='calibrate', ckpt_path=None):
     assert mode in ['calibrate', 'optimize']
-    ckpt_path = args.load_calibrate_checkpoint if mode == 'calibrate' else args.load_optimize_checkpoint
+    if ckpt_path is None:
+        ckpt_path = args.load_calibrate_checkpoint if mode == 'calibrate' else args.load_optimize_checkpoint
     ckpt = torch.load(ckpt_path)
     for name, module in model.named_modules():
         if hasattr(module, 'mode'):
@@ -190,6 +219,166 @@ def load_model(model, args, device, mode='calibrate'):
     model.to(device)
     model.eval()
     return model
+
+
+def set_quant_mode(model, mode):
+    previous_modes = {}
+    for module in model.modules():
+        if hasattr(module, 'mode'):
+            previous_modes[module] = module.mode
+            module.mode = mode
+    return previous_modes
+
+
+def restore_quant_mode(previous_modes):
+    for module, mode in previous_modes.items():
+        module.mode = mode
+
+
+def get_classifier_head(model):
+    head = getattr(model, 'head', None)
+    if head is not None and hasattr(head, 'bias'):
+        return head
+    for name, module in model.named_modules():
+        if name.split('.')[-1] == 'head' and hasattr(module, 'bias'):
+            return module
+    return None
+
+
+def collect_teacher_logit_bias_delta(model, teacher_model, data_loader, device, max_abs):
+    previous_modes = set_quant_mode(model, 'quant_forward')
+    teacher_model.eval()
+    model.eval()
+    delta_sum = None
+    count = 0
+    with torch.no_grad():
+        for data, _ in data_loader:
+            data = data.to(device)
+            teacher_logits = teacher_model(data).float()
+            quant_logits = model(data).float()
+            batch_delta = (teacher_logits - quant_logits).sum(dim=0)
+            delta_sum = batch_delta if delta_sum is None else delta_sum + batch_delta
+            count += data.size(0)
+            torch.cuda.empty_cache()
+    restore_quant_mode(previous_modes)
+    if delta_sum is None or count == 0:
+        return None
+    delta = delta_sum / count
+    delta = delta - delta.mean()
+    return delta.clamp(min=-max_abs, max=max_abs)
+
+
+def evaluate_logit_metrics(model, data_loader, criterion, device, teacher_model=None):
+    previous_modes = set_quant_mode(model, 'quant_forward')
+    if teacher_model is not None:
+        teacher_model.eval()
+    model.eval()
+    total = 0
+    loss_sum = 0.0
+    kl_sum = 0.0
+    top1_sum = 0.0
+    top5_sum = 0.0
+    with torch.no_grad():
+        for data, target in data_loader:
+            data = data.to(device)
+            target = target.to(device)
+            output = model(data)
+            loss_sum += criterion(output, target).item() * data.size(0)
+            prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+            top1_sum += prec1.item() * data.size(0)
+            top5_sum += prec5.item() * data.size(0)
+            if teacher_model is not None:
+                teacher_logits = teacher_model(data)
+                kl = F.kl_div(
+                    F.log_softmax(output, dim=-1),
+                    F.softmax(teacher_logits, dim=-1),
+                    reduction='batchmean',
+                )
+                kl_sum += kl.item() * data.size(0)
+            total += data.size(0)
+            torch.cuda.empty_cache()
+    restore_quant_mode(previous_modes)
+    total = max(total, 1)
+    return {
+        'loss': loss_sum / total,
+        'kl': kl_sum / total if teacher_model is not None else None,
+        'top1': top1_sum / total,
+        'top5': top5_sum / total,
+    }
+
+
+def format_logit_metrics(metrics):
+    if metrics is None:
+        return 'n/a'
+    kl_text = 'n/a' if metrics['kl'] is None else '{:.6f}'.format(metrics['kl'])
+    return 'top1={:.3f}, top5={:.3f}, ce={:.6f}, teacher_kl={}'.format(
+        metrics['top1'], metrics['top5'], metrics['loss'], kl_text
+    )
+
+
+def guarded_head_logit_bias_correction(model, teacher_model, correction_loader, guard_loader,
+                                       criterion, device, max_abs):
+    if teacher_model is None:
+        logging.info('Logit bias correction skipped: teacher model is unavailable.')
+        return False
+    head = get_classifier_head(model)
+    if head is None or head.bias is None:
+        logging.info('Logit bias correction skipped: classifier head bias is unavailable.')
+        return False
+
+    old_bias = head.bias.detach().clone()
+    delta = collect_teacher_logit_bias_delta(model, teacher_model, correction_loader, device, max_abs)
+    if delta is None:
+        logging.info('Logit bias correction skipped: no correction samples.')
+        return False
+    delta = delta.to(head.bias.device, dtype=head.bias.dtype)
+
+    before = evaluate_logit_metrics(model, guard_loader, criterion, device, teacher_model=teacher_model)
+    logging.info('Logit bias correction guard before: {}'.format(format_logit_metrics(before)))
+
+    candidates = [0.25, 0.50, 0.75, 1.00]
+    best_alpha = 0.0
+    best_metrics = before
+    best_score = before['loss'] + (0.25 * before['kl'] if before['kl'] is not None else 0.0)
+    for alpha in candidates:
+        head.bias.data.copy_(old_bias + alpha * delta)
+        metrics = evaluate_logit_metrics(model, guard_loader, criterion, device, teacher_model=teacher_model)
+        score = metrics['loss'] + (0.25 * metrics['kl'] if metrics['kl'] is not None else 0.0)
+        logging.info(
+            'Logit bias correction candidate alpha={:.2f}: {}'.format(
+                alpha, format_logit_metrics(metrics)
+            )
+        )
+        top1_ok = metrics['top1'] >= before['top1'] - 0.05
+        ce_ok = metrics['loss'] <= before['loss'] + 0.001
+        kl_ok = metrics['kl'] is None or metrics['kl'] <= before['kl'] + 0.0005
+        ce_gain = before['loss'] - metrics['loss']
+        kl_gain = 0.0 if metrics['kl'] is None else before['kl'] - metrics['kl']
+        clear_gain = ce_gain >= 0.002 or kl_gain >= 0.001
+        if top1_ok and ce_ok and kl_ok and clear_gain and score < best_score:
+            best_alpha = alpha
+            best_metrics = metrics
+            best_score = score
+
+    if best_alpha > 0:
+        head.bias.data.copy_(old_bias + best_alpha * delta)
+        logging.info(
+            'Logit bias correction keep: alpha={:.2f}, before=({}), after=({}), max_abs_delta={:.6f}'.format(
+                best_alpha,
+                format_logit_metrics(before),
+                format_logit_metrics(best_metrics),
+                float(delta.abs().max().detach().cpu()),
+            )
+        )
+        return True
+
+    head.bias.data.copy_(old_bias)
+    logging.info(
+        'Logit bias correction revert: no candidate improved guarded CE/KL without hurting Top-1. before=({})'.format(
+            format_logit_metrics(before)
+        )
+    )
+    return False
 
 def main(args):
     logging.info("{} - start the process.".format(get_cur_time()))
@@ -231,8 +420,18 @@ def main(args):
         cfg.adaptive_p = False
     elif hasattr(args, 'adaptive_p'):
         cfg.adaptive_p = True
+    cfg.adaptive_candidate_select = getattr(cfg, 'adaptive_candidate_select', False)
+    if hasattr(args, 'adaptive_candidate_select'):
+        cfg.adaptive_candidate_select = True
+    elif hasattr(args, 'no_adaptive_candidate_select'):
+        cfg.adaptive_candidate_select = False
+    cfg.adaptive_candidate_margin = getattr(cfg, 'adaptive_candidate_margin', 0.003)
+    if args.adaptive_candidate_margin is not None:
+        cfg.adaptive_candidate_margin = args.adaptive_candidate_margin
     cfg.logit_guard = getattr(cfg, 'logit_guard', True)
-    if args.no_logit_guard:
+    if hasattr(args, 'logit_guard'):
+        cfg.logit_guard = True
+    elif hasattr(args, 'no_logit_guard'):
         cfg.logit_guard = False
     for name, value in vars(cfg).items():
         logging.info(f"{name}: {value}")
@@ -283,7 +482,7 @@ def main(args):
     criterion = nn.CrossEntropyLoss().to(device)
 
     # ================================================================
-    # Stage 0: Fisher-guided MLP Reconstruction (NEW — Unified FIM pipeline)
+    # Stage 0: Fisher-guided MLP Reconstruction (optional unified FIM pipeline)
     # ================================================================
     shared_raw_pred_softmaxs = None  # Will be shared across stages
     block_residual_stats = None
@@ -373,9 +572,16 @@ def main(args):
             model = wrap_reparamed_modules_in_net(model)
             model.to(device)
             logging.info("{} - {} guided calibration finished.".format(get_cur_time(), cfg.calib_metric))
-            save_model(model, args, cfg, mode='calibrate')
+            calibrate_ckpt_path = save_model(model, args, cfg, mode='calibrate')
             logging.info('Validating after calibration ...')
             val_loss, val_prec1, val_prec5 = validate(val_loader, model, criterion, print_freq=args.print_freq, device=device)
+            if args.optimize:
+                logging.info(
+                    "Reloading calibrated checkpoint before block reconstruction: {}".format(
+                        calibrate_ckpt_path
+                    )
+                )
+                model = load_model(model, args, device, mode='calibrate', ckpt_path=calibrate_ckpt_path)
             if cfg.calib_metric == 'fisher_diag' and (cfg.adaptive_k or cfg.adaptive_p) and args.optimize:
                 residual_calibrator = QuantCalibrator(
                     model, calib_loader,
@@ -393,6 +599,19 @@ def main(args):
     if args.optimize:
         logging.info('Building optim loader ...')
         calib_loader = g.calib_loader(num=cfg.optim_size, batch_size=cfg.optim_batch_size, seed=args.seed)
+        logit_guard_loader = None
+        if cfg.logit_guard and args.logit_guard_size > 0:
+            logging.info(
+                'Building held-out logit guard loader (size {}, seed {}) ...'.format(
+                    args.logit_guard_size,
+                    args.seed + args.logit_guard_seed_offset,
+                )
+            )
+            logit_guard_loader = g.calib_loader(
+                num=args.logit_guard_size,
+                batch_size=cfg.optim_batch_size,
+                seed=args.seed + args.logit_guard_seed_offset,
+            )
         logging.info("{} - start {} guided block reconstruction".format(get_cur_time(), cfg.optim_metric))
         block_reconstructor = BlockReconstructor(
             model, cfg.optim_batch_size, calib_loader,
@@ -402,9 +621,12 @@ def main(args):
             block_residual_stats=block_residual_stats,
             logit_guard=cfg.logit_guard,
             logit_guard_batches=args.logit_guard_batches,
+            logit_guard_loader=logit_guard_loader,
+            adaptive_candidate_select=cfg.adaptive_candidate_select,
+            adaptive_candidate_margin=cfg.adaptive_candidate_margin,
         )
         # Share Fisher base if available (unified FIM framework).
-        # NOTE: Skip sharing when Fisher calibration was used — the Fisher-guided
+        # NOTE: Skip sharing when Fisher calibration was used. The Fisher-guided
         # calibration already optimizes important channels, leaving little headroom
         # for Fisher-DPLR block recon on those same channels (diminishing returns).
         # Letting block_recon compute its own self-consistency softmaxs avoids this.
@@ -421,6 +643,28 @@ def main(args):
             skip_head=args.skip_head,
         )
         logging.info("{} - {} guided block reconstruction finished.".format(get_cur_time(), cfg.optim_metric))
+        if not args.no_logit_bias_correction:
+            logging.info('Building logit bias correction loaders ...')
+            bias_loader = g.calib_loader(
+                num=args.bias_correction_size,
+                batch_size=cfg.optim_batch_size,
+                seed=args.seed + args.bias_correction_seed_offset,
+            )
+            bias_guard_loader = g.calib_loader(
+                num=args.bias_correction_guard_size,
+                batch_size=cfg.optim_batch_size,
+                seed=args.seed + args.bias_correction_seed_offset + 1,
+            )
+            teacher_model_for_bias = full_model if 'full_model' in locals() else None
+            guarded_head_logit_bias_correction(
+                model,
+                teacher_model_for_bias,
+                bias_loader,
+                bias_guard_loader,
+                criterion,
+                device,
+                args.bias_correction_max_abs,
+            )
         save_model(model, args, cfg, mode='optimize')
     if args.load_optimize_checkpoint:
         logging.info('Building optim loader ...')

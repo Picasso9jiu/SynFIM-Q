@@ -23,6 +23,12 @@ class Config:
         self.p1 = 1.0
         self.p2 = 1.0
         self.dis_mode = 'q'
+        # Adaptive Fisher parameters
+        self.adaptive_k = False
+        self.adaptive_p = False
+        self.adaptive_candidate_select = False
+        self.adaptive_candidate_margin = 0.003
+        self.logit_guard = True
         # qdrop settings
         self.optim_mode = 'rinp'
         self.drop_prob = 0.5

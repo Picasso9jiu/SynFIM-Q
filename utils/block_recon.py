@@ -13,6 +13,7 @@ import logging
 import random
 import copy
 import re
+import statistics
 
 
 def patch_embed_forward(self, x):
@@ -81,7 +82,9 @@ def swin_patchmerging_forward(self, x):
 class BlockReconstructor(QuantCalibrator):
     def __init__(self, model, optim_batch_size,calib_loader, metric="mse", temp=20, k=1,
                  dis_mode='q', p1=1., p2=1., adaptive_k=True, adaptive_p=True,
-                 block_residual_stats=None, logit_guard=True, logit_guard_batches=None):
+                 block_residual_stats=None, logit_guard=True, logit_guard_batches=None,
+                 logit_guard_loader=None, adaptive_candidate_select=True,
+                 adaptive_candidate_margin=0.003):
         super().__init__(model, calib_loader)
         self.batch_size = optim_batch_size
         self.metric = metric
@@ -94,6 +97,11 @@ class BlockReconstructor(QuantCalibrator):
         self.block_residual_stats = block_residual_stats or {}
         self.logit_guard = logit_guard
         self.logit_guard_batches = logit_guard_batches
+        self.optim_logit_guard_loader = calib_loader
+        self.heldout_logit_guard_loader = logit_guard_loader
+        self.adaptive_candidate_select = adaptive_candidate_select
+        self.adaptive_candidate_margin = adaptive_candidate_margin
+        self.auto_base_k, self.auto_base_p1, self.auto_base_p2 = self.compute_auto_base_params()
         self.block_recon_summary = []
         self.blocks = {}
         self.quanted_blocks = []
@@ -142,94 +150,127 @@ class BlockReconstructor(QuantCalibrator):
         m = re.search(r'blocks\.(\d+)', name)
         return int(m.group(1)) if m else None
 
+    def compute_auto_base_params(self):
+        if not self.block_residual_stats or not (self.adaptive_k or self.adaptive_p):
+            return self.k, self.p1, self.p2
+
+        block_stats = [
+            stat for name, stat in self.block_residual_stats.items()
+            if self._block_index(name) is not None
+        ]
+        if not block_stats:
+            return self.k, self.p1, self.p2
+
+        norms = [float(stat.get('residual_norm', 1.0)) for stat in block_stats]
+        rels = [float(stat.get('rel', 0.0)) for stat in block_stats]
+        median_norm = statistics.median(norms)
+        high_norm_ratio = sum(norm >= 1.15 for norm in norms) / len(norms)
+        severe_norm_ratio = sum(norm >= 1.35 for norm in norms) / len(norms)
+        median_rel = statistics.median(rels)
+
+        base_k = self.k
+        if median_norm < 0.95 and high_norm_ratio < 0.20:
+            base_k = max(self.k - 1, 4)
+        elif median_norm >= 1.25 or severe_norm_ratio >= 0.25:
+            base_k = min(self.k + 1, 6)
+        base_k = max(4, min(6, base_k))
+
+        base_p1 = self.p1
+        base_p2 = self.p2
+        if median_norm >= 1.20 or severe_norm_ratio >= 0.25:
+            base_p1 *= 1.02
+        if severe_norm_ratio >= 0.40:
+            base_p1 *= 1.02
+        base_p1 = max(0.98, min(1.06, base_p1))
+        base_p2 = max(0.99, min(1.01, base_p2))
+
+        logging.info(
+            'Auto adaptive base: k={} p1={:.3f} p2={:.3f} '
+            '(median_norm={:.3f}, high_norm_ratio={:.3f}, severe_norm_ratio={:.3f}, median_rel={:.3f})'.format(
+                base_k, base_p1, base_p2, median_norm, high_norm_ratio, severe_norm_ratio, median_rel
+            )
+        )
+        return base_k, base_p1, base_p2
+
     def get_block_k(self, name):
-        """
-        Layered dynamic rank for Fisher low-rank approximation.
-        Assigns higher k to earlier/deeper layers where accurate Fisher
-        estimation matters more, and lower k to later/shallower layers.
+        return self.select_block_k(name)[0]
 
-        Tiere 1 (input + deep blocks 0-2):  k = min(self.k + 3, 12)
-        Tiere 2 (middle blocks 3-8):       k = self.k (global default, e.g. 5)
-        Tiere 3 (shallow blocks 9+):       k = self.k (same as middle)
-        Tiere 4 (head):                     k = max(self.k - 2, 1)
-
-        For 3-bit: pass --k 8 to shift all tiers up (12, 8, 8, 6).
-        """
+    def select_block_k(self, name):
+        """Select Fisher low-rank update count from calibration residuals."""
         if not self.adaptive_k:
-            return self.k
+            return self.k, 'adaptive_k_disabled'
+        base_k = self.auto_base_k
         stat = self.block_residual_stats.get(name)
         if stat is not None:
             residual_norm = float(stat.get('residual_norm', 1.0))
             if 'patch_embed' in name:
-                return min(self.k + 1, 9)
+                # Patch embedding is input-sensitive; the best C+E run kept one
+                # extra Fisher refresh here while still relying on the guard.
+                return min(base_k + 1, 7), 'patch_embed_input_sensitive'
             if 'head' in name:
-                return self.k
+                return base_k, 'head_base'
             idx = self._block_index(name)
-            block_k = self.k
-            if idx is not None and idx <= 5 and residual_norm >= 1.05:
-                block_k = min(self.k + 1, 9)
-            elif idx is not None and idx <= 8 and residual_norm >= 1.10:
-                block_k = min(self.k + 1, 9)
-            return block_k
+            block_k = base_k
+            reason = 'base'
+            if idx is not None and idx <= 6 and residual_norm >= 1.05:
+                block_k = min(base_k + 1, 7)
+                reason = 'high_residual_plus1'
+            elif idx is not None and idx <= 8 and residual_norm >= 1.15:
+                block_k = min(base_k + 1, 7)
+                reason = 'mid_high_residual_plus1'
+            return block_k, reason
         if 'patch_embed' in name:
-            return min(self.k + 3, 12)
+            return min(self.k + 3, 12), 'fallback_patch_embed'
         m = re.search(r'blocks\.(\d+)', name)
         if m:
             idx = int(m.group(1))
             if idx <= 2:
-                return min(self.k + 3, 12)
+                return min(self.k + 3, 12), 'fallback_early_plus3'
             elif idx <= 8:
-                return self.k
+                return self.k, 'fallback_mid_base'
             else:
-                return self.k
+                return self.k, 'fallback_tail_base'
         if 'head' in name:
-            return max(self.k - 2, 1)
-        return self.k
+            return max(self.k - 2, 1), 'fallback_head_minus2'
+        return self.k, 'fallback_base'
 
     def compute_adaptive_p1p2(self, name, block):
         """
-        Adaptive p1/p2 weights based on per-block activation std.
-        Uses absolute thresholds calibrated for ViT activation ranges.
+        Select adaptive p1/p2 from residual statistics.
 
-        ViT activations exhibit natural depth decay: early blocks (0-3)
-        have std ~2-4, later blocks (9-11) have std ~0.5-1.5.
-
-        - High variance (std > 2.5): increase low-rank term (p1↑, p2↓)
-          Richer channel correlations → Fisher low-rank is more informative.
-        - Normal (1.0 < std <= 2.5): keep default (p1=p2=base)
-        - Low variance (std <= 1.0): increase diagonal term (p1↓, p2↑)
-          Less channel structure → per-channel diag weighting is more stable.
-
-        Returns (p1, p2) tuple.
+        The fixed candidate always uses self.p1/self.p2. The adaptive
+        candidate starts from the auto base and only applies mild residual
+        changes, because previous runs showed aggressive p2 changes hurt W4A4.
         """
         if not self.adaptive_p:
             return self.p1, self.p2
+        base_p1, base_p2 = self.auto_base_p1, self.auto_base_p2
         stat = self.block_residual_stats.get(name)
         if stat is not None:
             residual_norm = float(stat.get('residual_norm', 1.0))
             idx = self._block_index(name)
             if 'patch_embed' in name:
-                return self.p1 * 0.98, self.p2
+                return base_p1 * 0.98, base_p2
             if 'head' in name or idx is None:
-                return self.p1, self.p2
+                return base_p1, base_p2
             if residual_norm >= 1.0:
                 boost = min((residual_norm - 1.0) * 0.18, 0.07)
                 if idx <= 6:
-                    return self.p1 * (1.0 + boost), self.p2
-                return self.p1 * (1.0 + 0.5 * boost), self.p2
+                    return base_p1 * (1.0 + boost), base_p2
+                return base_p1 * (1.0 + 0.5 * boost), base_p2
             if idx >= 8:
                 damp = min((1.0 - residual_norm) * 0.04, 0.025)
-                return self.p1 * (1.0 - damp), self.p2
-            return self.p1, self.p2
+                return base_p1 * (1.0 - damp), base_p2
+            return base_p1, base_p2
         if block.raw_out is None:
-            return self.p1, self.p2
+            return base_p1, base_p2
         block_std = block.raw_out.std().item()
         if block_std > 2.5:
-            return self.p1 * 1.3, self.p2 * 0.7
+            return base_p1 * 1.3, base_p2 * 0.7
         elif block_std > 1.0:
-            return self.p1, self.p2
+            return base_p1, base_p2
         else:
-            return self.p1 * 0.7, self.p2 * 1.3
+            return base_p1 * 0.7, base_p2 * 1.3
 
     def replace_block(self, target_block, new_block):
         self._replace_block_recursive(self.model, target_block, new_block)
@@ -326,6 +367,14 @@ class BlockReconstructor(QuantCalibrator):
                 'top1_drop_tol': 0.010,
                 'flip_tol': 10,
             }
+        if idx == 6:
+            return {
+                'ce_tol': 0.060,
+                'true_prob_tol': 0.018,
+                'margin_tol': 0.025,
+                'top1_drop_tol': 0.012,
+                'flip_tol': 10,
+            }
         if idx >= 9:
             return {
                 'ce_tol': 0.015,
@@ -350,7 +399,20 @@ class BlockReconstructor(QuantCalibrator):
             'flip_tol': 10,
         }
 
-    def evaluate_logit_guard(self, device):
+    def select_logit_guard_loader(self, name):
+        if self.heldout_logit_guard_loader is None:
+            return self.optim_logit_guard_loader, 'optim'
+        idx = self._block_index(name)
+        if idx is None:
+            if 'patch_embed' in name:
+                return self.optim_logit_guard_loader, 'optim'
+            return self.heldout_logit_guard_loader, 'heldout'
+        if idx >= 8:
+            return self.heldout_logit_guard_loader, 'heldout'
+        return self.optim_logit_guard_loader, 'optim'
+
+    def evaluate_logit_guard(self, device, name=None):
+        guard_loader, guard_source = self.select_logit_guard_loader(name or '')
         previous_modes = {}
         for _, module in self.model.named_modules():
             if hasattr(module, 'mode'):
@@ -365,7 +427,7 @@ class BlockReconstructor(QuantCalibrator):
         pred_chunks = []
         correct_chunks = []
         with torch.no_grad():
-            for batch_idx, (inp, target) in enumerate(self.calib_loader):
+            for batch_idx, (inp, target) in enumerate(guard_loader):
                 if self.logit_guard_batches is not None and batch_idx >= self.logit_guard_batches:
                     break
                 inp = inp.to(device)
@@ -401,14 +463,15 @@ class BlockReconstructor(QuantCalibrator):
             'margin': margin_sum / total,
             'pred': torch.cat(pred_chunks, dim=0) if pred_chunks else torch.empty(0, dtype=torch.long),
             'correct': torch.cat(correct_chunks, dim=0) if correct_chunks else torch.empty(0, dtype=torch.bool),
+            'source': guard_source,
         }
 
     @staticmethod
     def format_logit_guard_stats(stats):
         if stats is None:
             return 'n/a'
-        return 'top1={:.4f}, ce={:.4f}, true_prob={:.4f}, margin={:.4f}'.format(
-            stats['top1'], stats['ce'], stats['true_prob'], stats['margin']
+        return 'top1={:.4f}, ce={:.4f}, true_prob={:.4f}, margin={:.4f}, source={}'.format(
+            stats['top1'], stats['ce'], stats['true_prob'], stats['margin'], stats.get('source', 'n/a')
         )
 
     def should_revert_by_logit_guard(self, name, before_stats, after_stats):
@@ -434,13 +497,15 @@ class BlockReconstructor(QuantCalibrator):
         ce_harm = ce_increase > profile['ce_tol']
         confidence_harm = true_prob_drop > profile['true_prob_tol'] and margin_drop > profile['margin_tol']
         top1_harm = (
-            top1_drop > profile['top1_drop_tol']
+            self.should_use_label_flip_guard(name)
+            and top1_drop > profile['top1_drop_tol']
             and ce_increase > -0.005
             and true_prob_drop > -0.002
         )
         harmful_flips = right_to_wrong - wrong_to_right
         flip_harm = (
-            harmful_flips > profile['flip_tol']
+            self.should_use_label_flip_guard(name)
+            and harmful_flips > profile['flip_tol']
             and ce_increase > -0.005
             and true_prob_drop > -0.002
         )
@@ -469,6 +534,10 @@ class BlockReconstructor(QuantCalibrator):
             'margin_drop={:.4f}, pred_flips={}, right_to_wrong={}, wrong_to_right={}'
         ).format(top1_drop, ce_increase, true_prob_drop, margin_drop, flips, right_to_wrong, wrong_to_right)
 
+    def should_use_label_flip_guard(self, name):
+        idx = self._block_index(name)
+        return idx is None or idx >= 9
+
     def has_strong_logit_improvement(self, name, before_stats, after_stats):
         if before_stats is None or after_stats is None:
             return False
@@ -493,6 +562,33 @@ class BlockReconstructor(QuantCalibrator):
             and margin_gain >= 0.010
             and true_prob_gain >= -0.002
             and wrong_to_right >= right_to_wrong
+        )
+
+    def has_tail_logit_override(self, name, before_stats, after_stats):
+        """Allow a narrow block.10 keep when classifier logits clearly improve."""
+        if before_stats is None or after_stats is None:
+            return False
+        idx = self._block_index(name)
+        if idx != 10:
+            return False
+        top1_drop = before_stats['top1'] - after_stats['top1']
+        ce_gain = before_stats['ce'] - after_stats['ce']
+        true_prob_gain = after_stats['true_prob'] - before_stats['true_prob']
+        margin_gain = after_stats['margin'] - before_stats['margin']
+        if (
+            before_stats['correct'].numel() == after_stats['correct'].numel()
+            and before_stats['correct'].numel() > 0
+        ):
+            right_to_wrong = (before_stats['correct'] & ~after_stats['correct']).sum().item()
+            wrong_to_right = (~before_stats['correct'] & after_stats['correct']).sum().item()
+        else:
+            right_to_wrong = wrong_to_right = 0
+        return (
+            ce_gain >= 0.025
+            and true_prob_gain >= 0.006
+            and margin_gain >= 0.035
+            and top1_drop <= 0.004
+            and (right_to_wrong - wrong_to_right) <= 4
         )
 
     def should_reconstruct_block(self, name, block_start=None, block_end=None,
@@ -643,17 +739,376 @@ class BlockReconstructor(QuantCalibrator):
         # block.inverse_B = torch.eye(block.raw_grad.shape[0]).to(device)
         del raw_grad, delta_out
         torch.cuda.empty_cache()
-            
-    def reconstruct_single_block(self, name, block, device,
-                                 batch_size: int = 32, iters: int = 20000, weight: float = 0.01,
-                                 b_range: tuple = (20, 2), warmup: float = 0.2, lr: float = 4e-5, p: float = 2.0,
-                                 quant_act = False, mode = 'qdrop', drop_prob: float = 1.0):
+
+    def fixed_candidate_params(self, name):
+        return self.k, 'fixed_base', self.p1, self.p2
+
+    @staticmethod
+    def params_are_same(left, right):
+        return (
+            left[0] == right[0]
+            and abs(left[2] - right[2]) < 1e-9
+            and abs(left[3] - right[3]) < 1e-9
+        )
+
+    @staticmethod
+    def _relative_mse(post_mse, pre_mse):
+        if pre_mse is None or post_mse is None or pre_mse <= 0:
+            return 0.0
+        return post_mse / pre_mse
+
+    def candidate_score(self, pre_mse, result):
+        if result['should_revert']:
+            return -1e9
+        stats = result['post_logit_guard']
+        if stats is None:
+            return -self._relative_mse(result['post_recon_mse'], pre_mse)
+        rel_mse = self._relative_mse(result['post_recon_mse'], pre_mse)
+        return (
+            2.0 * stats['top1']
+            - stats['ce']
+            + 0.10 * stats['true_prob']
+            + 0.02 * stats['margin']
+            - 0.05 * rel_mse
+        )
+
+    def run_reconstruction_candidate(self, name, block, device, candidate_name,
+                                     block_k, block_k_reason, block_p1, block_p2,
+                                     pre_recon_state, pre_recon_mse, pre_logit_guard,
+                                     batch_size, iters, weight, b_range, warmup, lr,
+                                     quant_act, mode, drop_prob):
+        block.load_state_dict(pre_recon_state, strict=True)
+        if self.metric in ["fisher_lr", "fisher_diag", "fisher_dplr"]:
+            block.raw_grad = None
+            block.delta_out = None
+            block.inverse_B = None
+            block.tmp_grad = None
+            block.tmp_out = None
+        self.set_block_soft_targets(block, True)
+        self.set_block_mode(block, 'quant_forward')
+        for _, module in block.named_modules():
+            if hasattr(module, 'training_mode'):
+                module.init_training()
+        if mode == 'qdrop':
+            self.set_qdrop(block, drop_prob)
+
+        w_params, a_params = [], []
+        for _, module in block.named_modules():
+            if hasattr(module, 'mode'):
+                if isinstance(module, MinMaxQuantLinear) or isinstance(module, MinMaxQuantConv2d):
+                    w_params += [module.w_quantizer.alpha]
+                    if quant_act:
+                        module.a_quantizer.scale.requires_grad = True
+                        a_params += [module.a_quantizer.scale]
+                    else:
+                        module.mode = 'debug_only_quant_weight'
+                elif isinstance(module, MinMaxQuantMatMul):
+                    if quant_act:
+                        module.A_quantizer.scale.requires_grad = True
+                        module.B_quantizer.scale.requires_grad = True
+                        a_params += [module.A_quantizer.scale, module.B_quantizer.scale]
+                    else:
+                        module.mode = 'raw'
+
+        w_optimizer = torch.optim.Adam(w_params)
+        a_optimizer = torch.optim.Adam(a_params, lr=lr) if len(a_params) != 0 else None
+        a_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(a_optimizer, T_max=iters, eta_min=0.) if len(a_params) != 0 else None
+
+        logging.info(
+            'Block {} candidate {}: k={} ({}) p1={:.3f} p2={:.3f}'.format(
+                name, candidate_name, block_k, block_k_reason, block_p1, block_p2
+            )
+        )
+        loss_func = LossFunction(block, round_loss='relaxation', weight=weight, max_count=iters,
+                                 rec_loss=self.metric if 'head' not in name else 'kl_div',
+                                 b_range=b_range, decay_start=0, warmup=warmup, p1=block_p1, p2=block_p2)
+        i_change = max(1, math.floor(iters / max(block_k, 1)))
+        for it in range(iters):
+            idx = torch.randperm(block.raw_input.size(0))[:batch_size]
+            if mode == 'qdrop':
+                cur_quant_inp = block.quanted_input[idx].to(device) if block.quanted_input is not None else block.raw_input[idx].to(device)
+                cur_fp_inp = block.raw_input[idx].to(device)
+                cur_inp = torch.where(torch.rand_like(cur_quant_inp) < drop_prob, cur_quant_inp, cur_fp_inp)
+            elif mode == 'rinp':
+                cur_inp = block.raw_input[idx].to(device)
+            elif mode == 'qinp':
+                cur_inp = block.quanted_input[idx].to(device)
+            cur_out = block.raw_out[idx].to(device)
+
+            loss_func.update_fisher = False
+            if loss_func.rec_loss in ["fisher_lr", "fisher_diag", "fisher_dplr"]:
+                if self.dis_mode in ['q']:
+                    if it % i_change == 0:
+                        self.new_fisher_ro(block, device)
+                        loss_func.update_fisher = True
+                elif self.dis_mode in ['qf']:
+                    if it in range(block_k):
+                        self.new_fisher_ro(block, device)
+                        loss_func.update_fisher = True
+                cur_grad = block.raw_grad.to(device)
+            elif self.metric == "fisher_brecq":
+                cur_grad = block.raw_grad[idx].to(device)
+            else:
+                cur_grad = None
+            w_optimizer.zero_grad()
+            if quant_act:
+                a_optimizer.zero_grad()
+            out_quant = block(cur_inp)
+            if 'head' not in name:
+                err = loss_func(out_quant, cur_out, cur_grad)
+            else:
+                err = loss_func(out_quant, cur_out)
+            err.backward()
+            w_optimizer.step()
+            if quant_act:
+                a_optimizer.step()
+                a_scheduler.step()
+
+        torch.cuda.empty_cache()
+        for _, module in block.named_modules():
+            if hasattr(module, 'w_quantizer'):
+                module.w_quantizer.soft_targets = False
+            if hasattr(module, 'mode'):
+                module.mode = 'raw'
+            if hasattr(module, 'training_mode'):
+                module.end_training()
+            if isinstance(module, MinMaxQuantLinear) or isinstance(module, MinMaxQuantConv2d):
+                module.a_quantizer.scale.requires_grad = False
+            elif isinstance(module, MinMaxQuantMatMul):
+                module.A_quantizer.scale.requires_grad = False
+                module.B_quantizer.scale.requires_grad = False
+        self.set_qdrop(block, 1.0)
+
+        post_recon_mse = self.estimate_block_mse(block, device, mode=mode)
+        post_logit_guard = self.evaluate_logit_guard(device, name=name) if self.logit_guard else None
+        logit_should_revert, logit_guard_reason = self.should_revert_by_logit_guard(
+            name, pre_logit_guard, post_logit_guard
+        )
+        strong_logit_improvement = self.has_strong_logit_improvement(name, pre_logit_guard, post_logit_guard)
+        tail_logit_override = self.has_tail_logit_override(name, pre_logit_guard, post_logit_guard)
+
+        last_total_loss = None
+        last_rec_loss = None
+        last_round_loss = None
+        if loss_func.last_total_loss is not None:
+            last_total_loss = LossFunction.to_float(loss_func.last_total_loss)
+            last_rec_loss = LossFunction.to_float(loss_func.last_rec_loss)
+            last_round_loss = LossFunction.to_float(loss_func.last_round_loss)
+
+        guard_threshold = self.block_guard_threshold(name)
+        loss_revert_threshold = self.block_loss_revert_threshold(name)
+        mse_should_revert = (
+            pre_recon_mse is not None
+            and post_recon_mse is not None
+            and post_recon_mse > pre_recon_mse * guard_threshold
+        )
+        loss_should_revert = (
+            loss_revert_threshold is not None
+            and last_total_loss is not None
+            and last_total_loss > loss_revert_threshold
+        )
+        idx = self._block_index(name)
+        weak_tail_gain_should_revert = (
+            idx is not None
+            and idx >= 10
+            and pre_recon_mse is not None
+            and post_recon_mse is not None
+            and post_recon_mse > pre_recon_mse * 0.99
+        )
+        logit_override = strong_logit_improvement or tail_logit_override
+        should_revert = (mse_should_revert or loss_should_revert) and not logit_override
+        if weak_tail_gain_should_revert:
+            should_revert = not tail_logit_override
+        if logit_should_revert:
+            should_revert = True
+
+        result = {
+            'candidate': candidate_name,
+            'state': self._clone_state_dict(block),
+            'total_loss': last_total_loss,
+            'rec_loss': last_rec_loss,
+            'round_loss': last_round_loss,
+            'b': loss_func.last_b,
+            'count': loss_func.count,
+            'k': block_k,
+            'k_reason': block_k_reason,
+            'p1': block_p1,
+            'p2': block_p2,
+            'post_recon_mse': post_recon_mse,
+            'post_logit_guard': post_logit_guard,
+            'logit_guard': logit_guard_reason,
+            'strong_logit_improvement': strong_logit_improvement,
+            'tail_logit_override': tail_logit_override,
+            'should_revert': should_revert,
+        }
+        result['score'] = self.candidate_score(pre_recon_mse, result)
+        logging.info(
+            'Block {} candidate {} result: score={:.6f}, revert={}, mse {:.6e}->{:.6e}, logit after=({}), logit_guard={}'.format(
+                name,
+                candidate_name,
+                result['score'],
+                should_revert,
+                pre_recon_mse if pre_recon_mse is not None else float('nan'),
+                post_recon_mse if post_recon_mse is not None else float('nan'),
+                self.format_logit_guard_stats(post_logit_guard),
+                logit_guard_reason,
+            )
+        )
+        return result
+
+    def reconstruct_single_block_with_candidate_select(self, name, block, device,
+                                                       batch_size=32, iters=20000, weight=0.01,
+                                                       b_range=(20, 2), warmup=0.2, lr=4e-5,
+                                                       quant_act=False, mode='qdrop', drop_prob=1.0):
         block_name = name
         self.wrap_quantizers_in_net(block, name)
         self.set_block_soft_targets(block, False)
         pre_recon_state = self._clone_state_dict(block)
         pre_recon_mse = self.estimate_block_mse(block, device, mode=mode)
-        pre_logit_guard = self.evaluate_logit_guard(device) if self.logit_guard else None
+        pre_logit_guard = self.evaluate_logit_guard(device, name=block_name) if self.logit_guard else None
+        logging.info('Block {} logit guard before: {}'.format(
+            block_name, self.format_logit_guard_stats(pre_logit_guard)
+        ))
+
+        fixed_params = self.fixed_candidate_params(name)
+        adaptive_k, adaptive_k_reason = self.select_block_k(name)
+        adaptive_p1, adaptive_p2 = self.compute_adaptive_p1p2(name, block)
+        adaptive_params = (adaptive_k, adaptive_k_reason, adaptive_p1, adaptive_p2)
+        if self.params_are_same(fixed_params, adaptive_params):
+            candidates = [('adaptive_same_as_fixed', adaptive_params)]
+            logging.info('Block {} candidate selection skipped: adaptive params match fixed params.'.format(name))
+        else:
+            candidates = [
+                ('fixed', fixed_params),
+                ('adaptive', adaptive_params),
+            ]
+            logging.info(
+                'Block {} candidate selection enabled: fixed k={} p1={:.3f} p2={:.3f}; adaptive k={} ({}) p1={:.3f} p2={:.3f}'.format(
+                    name,
+                    fixed_params[0],
+                    fixed_params[2],
+                    fixed_params[3],
+                    adaptive_params[0],
+                    adaptive_params[1],
+                    adaptive_params[2],
+                    adaptive_params[3],
+                )
+            )
+
+        results = []
+        py_state = random.getstate()
+        np_state = np.random.get_state()
+        torch_state = torch.random.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        for candidate_name, params in candidates:
+            random.setstate(py_state)
+            np.random.set_state(np_state)
+            torch.random.set_rng_state(torch_state.clone())
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all([state.clone() for state in cuda_states])
+            block_k, block_k_reason, block_p1, block_p2 = params
+            results.append(
+                self.run_reconstruction_candidate(
+                    name, block, device, candidate_name,
+                    block_k, block_k_reason, block_p1, block_p2,
+                    pre_recon_state, pre_recon_mse, pre_logit_guard,
+                    batch_size, iters, weight, b_range, warmup, lr,
+                    quant_act, mode, drop_prob,
+                )
+            )
+
+        best = max(results, key=lambda item: item['score'])
+        if len(results) == 2:
+            fixed_result = next((item for item in results if item['candidate'] == 'fixed'), None)
+            adaptive_result = next((item for item in results if item['candidate'] == 'adaptive'), None)
+            if fixed_result is not None and adaptive_result is not None:
+                if adaptive_result['score'] > fixed_result['score'] + self.adaptive_candidate_margin:
+                    best = adaptive_result
+                elif fixed_result['score'] > -1e8:
+                    best = fixed_result
+                else:
+                    best = adaptive_result if adaptive_result['score'] > fixed_result['score'] else fixed_result
+        if best['should_revert']:
+            guard_action = 'revert'
+            block.load_state_dict(pre_recon_state, strict=True)
+            self.set_block_soft_targets(block, False)
+            logging.info(
+                'Block {} candidate selection: all candidates rejected; revert to pre-reconstruction state.'.format(
+                    block_name
+                )
+            )
+        else:
+            guard_action = 'keep_{}'.format(best['candidate'])
+            block.load_state_dict(best['state'], strict=True)
+            self.set_block_soft_targets(block, False)
+            logging.info(
+                'Block {} candidate selection: chose {} (score {:.6f}).'.format(
+                    block_name, best['candidate'], best['score']
+                )
+            )
+
+        if best['total_loss'] is not None:
+            logging.info(
+                'Block {} final loss: total={:.6f} rec={:.6f} round={:.6f} b={:.2f} count={} k={} k_reason={} p1={:.3f} p2={:.3f} guard={} mse_before={} mse_after={} logit_before=({}) logit_after=({})'.format(
+                    block_name,
+                    best['total_loss'],
+                    best['rec_loss'],
+                    best['round_loss'],
+                    best['b'],
+                    best['count'],
+                    best['k'],
+                    best['k_reason'],
+                    best['p1'],
+                    best['p2'],
+                    guard_action,
+                    '{:.6e}'.format(pre_recon_mse) if pre_recon_mse is not None else 'n/a',
+                    '{:.6e}'.format(best['post_recon_mse']) if best['post_recon_mse'] is not None else 'n/a',
+                    self.format_logit_guard_stats(pre_logit_guard),
+                    self.format_logit_guard_stats(best['post_logit_guard']),
+                )
+            )
+            self.block_recon_summary.append({
+                'name': block_name,
+                'total_loss': best['total_loss'],
+                'rec_loss': best['rec_loss'],
+                'round_loss': best['round_loss'],
+                'b': best['b'],
+                'count': best['count'],
+                'k': best['k'],
+                'k_reason': best['k_reason'],
+                'p1': best['p1'],
+                'p2': best['p2'],
+                'guard': guard_action,
+                'mse_before': pre_recon_mse,
+                'mse_after': best['post_recon_mse'],
+                'logit_before': pre_logit_guard,
+                'logit_after': best['post_logit_guard'],
+                'logit_guard': best['logit_guard'],
+            })
+
+        for result in results:
+            del result['state']
+        del pre_recon_state
+        del block.raw_input, block.raw_out, block.raw_grad, block.quanted_input
+        torch.cuda.empty_cache()
+            
+    def reconstruct_single_block(self, name, block, device,
+                                 batch_size: int = 32, iters: int = 20000, weight: float = 0.01,
+                                 b_range: tuple = (20, 2), warmup: float = 0.2, lr: float = 4e-5, p: float = 2.0,
+                                 quant_act = False, mode = 'qdrop', drop_prob: float = 1.0):
+        if self.adaptive_candidate_select and (self.adaptive_k or self.adaptive_p):
+            return self.reconstruct_single_block_with_candidate_select(
+                name, block, device,
+                batch_size=batch_size, iters=iters, weight=weight,
+                b_range=b_range, warmup=warmup, lr=lr,
+                quant_act=quant_act, mode=mode, drop_prob=drop_prob,
+            )
+        block_name = name
+        self.wrap_quantizers_in_net(block, name)
+        self.set_block_soft_targets(block, False)
+        pre_recon_state = self._clone_state_dict(block)
+        pre_recon_mse = self.estimate_block_mse(block, device, mode=mode)
+        pre_logit_guard = self.evaluate_logit_guard(device, name=block_name) if self.logit_guard else None
         post_recon_mse = None
         post_logit_guard = None
         logit_guard_reason = 'disabled'
@@ -690,15 +1145,17 @@ class BlockReconstructor(QuantCalibrator):
         a_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(a_optimizer, T_max=iters, eta_min=0.) if len(a_params) != 0 else None
 
         # --- Dynamic k and adaptive p1/p2 ---
-        block_k = self.get_block_k(name)
+        block_k, block_k_reason = self.select_block_k(name)
         block_p1, block_p2 = self.compute_adaptive_p1p2(name, block)
         if self.adaptive_k:
             stat = self.block_residual_stats.get(name)
             if stat is not None:
-                logging.info('Block {} residual-aware dynamic k={} (base k={}, residual_norm={:.3f})'
-                             .format(name, block_k, self.k, float(stat.get('residual_norm', 1.0))))
+                logging.info('Block {} residual-aware dynamic k={} (base k={}, residual_norm={:.3f}, reason={})'
+                             .format(name, block_k, self.auto_base_k, float(stat.get('residual_norm', 1.0)),
+                                     block_k_reason))
             else:
-                logging.info('Block {} dynamic k={} (base k={})'.format(name, block_k, self.k))
+                logging.info('Block {} dynamic k={} (base k={}, reason={})'
+                             .format(name, block_k, self.auto_base_k, block_k_reason))
         if self.adaptive_p:
             stat = self.block_residual_stats.get(name)
             if stat is not None:
@@ -771,11 +1228,12 @@ class BlockReconstructor(QuantCalibrator):
                 module.B_quantizer.scale.requires_grad = False
         self.set_qdrop(block, 1.0)
         post_recon_mse = self.estimate_block_mse(block, device, mode=mode)
-        post_logit_guard = self.evaluate_logit_guard(device) if self.logit_guard else None
+        post_logit_guard = self.evaluate_logit_guard(device, name=block_name) if self.logit_guard else None
         logit_should_revert, logit_guard_reason = self.should_revert_by_logit_guard(
             block_name, pre_logit_guard, post_logit_guard
         )
         strong_logit_improvement = self.has_strong_logit_improvement(block_name, pre_logit_guard, post_logit_guard)
+        tail_logit_override = self.has_tail_logit_override(block_name, pre_logit_guard, post_logit_guard)
         logging.info('Block {} logit guard after: {} ({})'.format(
             block_name, self.format_logit_guard_stats(post_logit_guard), logit_guard_reason
         ))
@@ -791,13 +1249,20 @@ class BlockReconstructor(QuantCalibrator):
             loss_revert_threshold = self.block_loss_revert_threshold(block_name)
             mse_should_revert = post_recon_mse > pre_recon_mse * guard_threshold
             loss_should_revert = False
+            weak_tail_gain_should_revert = False
             if (
                 loss_revert_threshold is not None
                 and last_total_loss is not None
                 and last_total_loss > loss_revert_threshold
             ):
                 loss_should_revert = True
-            should_revert = (mse_should_revert or loss_should_revert) and not strong_logit_improvement
+            idx = self._block_index(block_name)
+            if idx is not None and idx >= 10:
+                weak_tail_gain_should_revert = post_recon_mse > pre_recon_mse * 0.99
+            logit_override = strong_logit_improvement or tail_logit_override
+            should_revert = (mse_should_revert or loss_should_revert) and not logit_override
+            if weak_tail_gain_should_revert:
+                should_revert = not tail_logit_override
             if logit_should_revert:
                 should_revert = True
             if should_revert:
@@ -817,14 +1282,14 @@ class BlockReconstructor(QuantCalibrator):
             else:
                 guard_action = 'keep'
                 logging.info(
-                    'Block {} guard: keep AdaRound update (mse {:.6e} -> {:.6e}, threshold {:.6f}, logit_guard {}, strong_logit_improvement {}).'.format(
+                    'Block {} guard: keep AdaRound update (mse {:.6e} -> {:.6e}, threshold {:.6f}, logit_guard {}, strong_logit_improvement {}, tail_logit_override {}).'.format(
                         block_name, pre_recon_mse, post_recon_mse, guard_threshold,
-                        logit_guard_reason, strong_logit_improvement
+                        logit_guard_reason, strong_logit_improvement, tail_logit_override
                     )
                 )
         if last_total_loss is not None:
             logging.info(
-                'Block {} final loss: total={:.6f} rec={:.6f} round={:.6f} b={:.2f} count={} k={} p1={:.3f} p2={:.3f} guard={} mse_before={} mse_after={} logit_before=({}) logit_after=({})'.format(
+                'Block {} final loss: total={:.6f} rec={:.6f} round={:.6f} b={:.2f} count={} k={} k_reason={} p1={:.3f} p2={:.3f} guard={} mse_before={} mse_after={} logit_before=({}) logit_after=({})'.format(
                     block_name,
                     last_total_loss,
                     last_rec_loss,
@@ -832,6 +1297,7 @@ class BlockReconstructor(QuantCalibrator):
                     loss_func.last_b,
                     loss_func.count,
                     block_k,
+                    block_k_reason,
                     block_p1,
                     block_p2,
                     guard_action,
@@ -849,6 +1315,7 @@ class BlockReconstructor(QuantCalibrator):
                 'b': loss_func.last_b,
                 'count': loss_func.count,
                 'k': block_k,
+                'k_reason': block_k_reason,
                 'p1': block_p1,
                 'p2': block_p2,
                 'guard': guard_action,
@@ -891,12 +1358,13 @@ class BlockReconstructor(QuantCalibrator):
             logging.info('Block reconstruction final loss summary:')
             for item in self.block_recon_summary:
                 logging.info(
-                    '  {name}: total={total_loss:.6f}, rec={rec_loss:.6f}, round={round_loss:.6f}, k={k}, p1={p1:.3f}, p2={p2:.3f}, guard={guard}, mse={mse_before}->{mse_after}, logit={logit_before}->{logit_after}, logit_guard={logit_guard}'.format(
+                    '  {name}: total={total_loss:.6f}, rec={rec_loss:.6f}, round={round_loss:.6f}, k={k} ({k_reason}), p1={p1:.3f}, p2={p2:.3f}, guard={guard}, mse={mse_before}->{mse_after}, logit={logit_before}->{logit_after}, logit_guard={logit_guard}'.format(
                         name=item['name'],
                         total_loss=item['total_loss'],
                         rec_loss=item['rec_loss'],
                         round_loss=item['round_loss'],
                         k=item['k'],
+                        k_reason=item.get('k_reason', 'n/a'),
                         p1=item['p1'],
                         p2=item['p2'],
                         guard=item['guard'],
