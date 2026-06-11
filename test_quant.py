@@ -401,8 +401,8 @@ def main(args):
     cfg.optim_metric = args.optim_metric if hasattr(args, 'optim_metric') else cfg.optim_metric
     cfg.optim_mode = args.optim_mode if hasattr(args, 'optim_mode') else cfg.optim_mode
     cfg.drop_prob = args.drop_prob if hasattr(args, 'drop_prob') else cfg.drop_prob
-    cfg.recon_metric = args.recon_metric if hasattr(args, 'recon_metric') else cfg.recon_metric
-    cfg.pct = args.pct if hasattr(args, 'pct') else cfg.pct
+    cfg.recon_metric = args.recon_metric if hasattr(args, 'recon_metric') else getattr(cfg, 'recon_metric', 'fisher_diag')
+    cfg.pct = args.pct if hasattr(args, 'pct') else getattr(cfg, 'pct', 0.9999)
     cfg.w_bit = args.w_bit if hasattr(args, 'w_bit') else cfg.w_bit
     cfg.a_bit = args.a_bit if hasattr(args, 'a_bit') else cfg.a_bit
     cfg.k = args.k if hasattr(args, 'k') else cfg.k
@@ -548,7 +548,7 @@ def main(args):
             model = load_model(model, args, device, mode='calibrate')
             if args.test_calibrate_checkpoint:
                 val_loss, val_prec1, val_prec5 = validate(val_loader, model, criterion, print_freq=args.print_freq, device=device)
-            if cfg.calib_metric == 'fisher_diag' and (cfg.adaptive_k or cfg.adaptive_p) and args.optimize:
+            if (cfg.adaptive_k or cfg.adaptive_p) and args.optimize:
                 residual_loader = g.calib_loader(num=cfg.calib_size, batch_size=cfg.calib_batch_size, seed=args.seed)
                 residual_calibrator = QuantCalibrator(
                     model, residual_loader,
@@ -582,7 +582,7 @@ def main(args):
                     )
                 )
                 model = load_model(model, args, device, mode='calibrate', ckpt_path=calibrate_ckpt_path)
-            if cfg.calib_metric == 'fisher_diag' and (cfg.adaptive_k or cfg.adaptive_p) and args.optimize:
+            if (cfg.adaptive_k or cfg.adaptive_p) and args.optimize:
                 residual_calibrator = QuantCalibrator(
                     model, calib_loader,
                     calib_metric=cfg.calib_metric,

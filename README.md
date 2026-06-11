@@ -206,19 +206,19 @@ python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py --
 
 ### 4. 实验 C：MSE-Calib + Adaptive `k/p`
 
-实验 C 用于评估 adaptive `k/p` 模块本身，不叠加实验 B 的 Fisher-Calib，因此先使用实验 A 中生成的 MSE-Calib checkpoint。
+实验 C 用于评估 adaptive `k/p` 模块本身，不叠加实验 B 的 Fisher-Calib。该实验与实验 D 使用相同的 adaptive 候选选择逻辑，差别只在校准阶段使用 MSE-Calib。
 
-加载该 MSE-Calib checkpoint，只启用 adaptive `k/p`：
+可以用一条命令先生成 MSE-Calib checkpoint，再自动加载该 checkpoint 继续运行 adaptive `k/p`：
 
 ```bash
-python test_quant.py --model deit_tiny --config ./configs/4bit/best.py --dataset D:/AI/IaS-ViT-main/dataset/imagenet --load-calibrate-checkpoint checkpoints/quant_result/<timestamp>/deit_tiny_w4_a4_calibsize_128_mse.pth --optimize --w_bit 4 --a_bit 4 --calib-metric mse --optim-metric fisher_dplr --optim-size 1024 --val-batch-size 64 --num-workers 0 --device cuda --adaptive-k --adaptive-p --no-adaptive-candidate-select --logit-guard --no-logit-bias-correction
+python test_quant.py --model deit_tiny --config ./configs/4bit/best.py --dataset D:/AI/IaS-ViT-main/dataset/imagenet --calibrate --optimize --w_bit 4 --a_bit 4 --calib-metric mse --optim-metric fisher_dplr --optim-size 1024 --val-batch-size 64 --num-workers 0 --device cuda --adaptive-k --adaptive-p --adaptive-candidate-select --logit-guard --no-logit-bias-correction
 ```
 
 说明：
 
 - 这条命令用于 adaptive `k/p` 消融，只考察 adaptive `k/p` 在块重构阶段的作用。
 - 当前实验 C 结果还未补充，README 表格中暂时保留为空。
-- 如果希望评估更稳健的 adaptive 模块，可以把 `--no-adaptive-candidate-select` 改成 `--adaptive-candidate-select`，但这已经属于带候选选择和 guard 的增强版设置。
+- 实验 C 和实验 D 都启用 `--adaptive-candidate-select`，因此二者的 adaptive `k/p` 选择逻辑保持一致。
 
 ### 5. 实验 D / SynFIM-Q：Fisher-Calib + Adaptive `k/p`
 
