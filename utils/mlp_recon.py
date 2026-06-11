@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import timm
 from timm.models.vision_transformer import Block as ViTBlock
-from timm.models.swin_transformer import SwinTransformerBlock
+from timm.models.swin_transformer import SwinTransformerBlock, window_partition, window_reverse
 from utils.calibrator import QuantCalibrator
 from quantizers._ste import *
 from quant_layers import *

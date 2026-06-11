@@ -204,8 +204,8 @@ class BlockReconstructor(QuantCalibrator):
         if stat is not None:
             residual_norm = float(stat.get('residual_norm', 1.0))
             if 'patch_embed' in name:
-                # Patch embedding is input-sensitive; the best C+E run kept one
-                # extra Fisher refresh here while still relying on the guard.
+                # Patch embedding is input-sensitive; SynFIM-Q keeps one extra
+                # Fisher refresh here while still relying on the guard.
                 return min(base_k + 1, 7), 'patch_embed_input_sensitive'
             if 'head' in name:
                 return base_k, 'head_base'

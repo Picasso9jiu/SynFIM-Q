@@ -192,7 +192,7 @@ python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py --
 checkpoints/quant_result/<timestamp>/deit_tiny_w4_a4_calibsize_128_fisher_diag.pth
 ```
 
-README 中的日志目录只是本文实验记录，复现时请把 `<timestamp>` 替换为你本地实际生成的目录名。
+上述 `<timestamp>` 是本地运行时自动生成的 checkpoint 目录占位符，复现时请替换为你本地实际生成的目录名。
 
 ### 3. 实验 B：Fisher-Calib + 固定 `k/p`
 
