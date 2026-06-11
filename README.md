@@ -14,19 +14,19 @@ SynFIM-Q 是一个基于 PyTorch 的 Vision Transformer 后训练量化（Post-T
 - 校准样本数：128
 - 块重构样本数：1024
 
-| 方法 | 起点 | 块重构策略 | Top-1 | Top-5 | Loss | 日志 |
-|---|---|---|---:|---:|---:|---|
-| 实验 A / Baseline | MSE-Calib | 固定 `k=5, p1=p2=1` | 66.800 | - | - | - |
-| 实验 B | Fisher-Calib | 固定 `k=5, p1=p2=1` | 67.198 | 88.258 | 1.518 | `20260530_1051_C` |
-| 实验 C | MSE-Calib | 纯 Adaptive `k/p` | - | - | - | 待跑 |
-| 实验 D / **SynFIM-Q** | Fisher-Calib | **Adaptive `k/p`** | **67.414** | 88.302 | 1.476 | `20260610_2256` |
+| 方法 | 起点 | Top-1 | Top-5 | 相对 Baseline |
+|---|---|---:|---:|---:|
+| 实验 A / Baseline | MSE-Calib | 66.800 | - | - |
+| 实验 B | Fisher-Calib | 67.198 | 88.258 | +0.398 |
+| 实验 C | MSE-Calib | - | - | - |
+| 实验 D / **SynFIM-Q** | Fisher-Calib | **67.414** | 88.302 | **+0.614** |
 
 主要结论：
 
 - 相比实验 A / Baseline，SynFIM-Q 提升 `+0.614 Top-1`。
 - 相比实验 B，SynFIM-Q 进一步提升 `+0.216 Top-1`。
 - 实验结果说明，Fisher-Calib 可以提供更稳定的校准起点，而 adaptive `k/p` 可以在块重构阶段继续降低任务相关量化误差。
-- 实验 C 用于单独评估纯 adaptive `k/p` 模块，目前结果待补充。
+- 实验 C 用于单独评估 adaptive `k/p` 模块，不叠加实验 B 的 Fisher-Calib，目前结果待补充。
 - 当前更有效的做法不是全层统一增强 Fisher 项，而是根据 block 级统计和分类一致性自适应决定 Fisher-DPLR 参数。
 
 ## 方法动机
@@ -204,9 +204,9 @@ python test_quant.py --model deit_tiny --config ./configs/4bit/fim_unified.py --
 
 该命令用于复现实验 B。它保留 Fisher-Calib 和 Fisher-DPLR AdaRound，但不启用 adaptive 参数。
 
-### 4. 实验 C：MSE-Calib + 纯 Adaptive `k/p`
+### 4. 实验 C：MSE-Calib + Adaptive `k/p`
 
-如果要单独评估 adaptive `k/p` 模块，不引入 Fisher-Calib，先使用实验 A 中生成的 MSE-Calib checkpoint。
+实验 C 用于评估 adaptive `k/p` 模块本身，不叠加实验 B 的 Fisher-Calib，因此先使用实验 A 中生成的 MSE-Calib checkpoint。
 
 加载该 MSE-Calib checkpoint，只启用 adaptive `k/p`：
 
@@ -216,7 +216,7 @@ python test_quant.py --model deit_tiny --config ./configs/4bit/best.py --dataset
 
 说明：
 
-- 这条命令用于纯 adaptive `k/p` 消融，只考察 adaptive `k/p` 在块重构阶段的作用。
+- 这条命令用于 adaptive `k/p` 消融，只考察 adaptive `k/p` 在块重构阶段的作用。
 - 当前实验 C 结果还未补充，README 表格中暂时保留为空。
 - 如果希望评估更稳健的 adaptive 模块，可以把 `--no-adaptive-candidate-select` 改成 `--adaptive-candidate-select`，但这已经属于带候选选择和 guard 的增强版设置。
 
@@ -330,10 +330,10 @@ SynFIM-Q/
 
 ## 注意事项
 
-- 当前主结果以 Top-1 为主要指标；Top-5 和 Loss 不是所有历史实验中的最高值。
+- 当前主结果以 Top-1 为主要指标；Top-5 作为辅助参考。
 - 候选选择会增加运行时间，因为部分 block 会分别训练固定参数和自适应参数两个候选。
 - 为了保证对比严谨，实验 B 和实验 D 应加载同一个 Fisher-Calib checkpoint。
-- 实验 C 建议加载 MSE-Calib checkpoint，避免 Fisher-Calib 对纯 adaptive `k/p` 消融产生混淆。
+- 实验 C 建议加载 MSE-Calib checkpoint，避免 Fisher-Calib 对 adaptive `k/p` 消融产生混淆。
 - 当前主结果使用 `--no-logit-bias-correction`，因为此前实验中该模块收益不稳定。
 - `checkpoints/` 已在 `.gitignore` 中忽略，仓库不会上传实验 checkpoint。
 
