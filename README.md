@@ -18,15 +18,16 @@ SynFIM-Q 是一个基于 PyTorch 的 Vision Transformer 后训练量化（Post-T
 |---|---|---:|---:|---:|
 | 实验 A / Baseline | MSE-Calib | 66.800 | - | - |
 | 实验 B | Fisher-Calib | 67.198 | 88.258 | +0.398 |
-| 实验 C | MSE-Calib | - | - | - |
+| 实验 C | MSE-Calib | 66.904 | 88.048 | +0.104 |
 | 实验 D / **SynFIM-Q** | Fisher-Calib | **67.414** | 88.302 | **+0.614** |
 
 主要结论：
 
 - 相比实验 A / Baseline，SynFIM-Q 提升 `+0.614 Top-1`。
 - 相比实验 B，SynFIM-Q 进一步提升 `+0.216 Top-1`。
-- 实验结果说明，Fisher-Calib 可以提供更稳定的校准起点，而 adaptive `k/p` 可以在块重构阶段继续降低任务相关量化误差。
-- 实验 C 用于单独评估 adaptive `k/p` 模块，不叠加实验 B 的 Fisher-Calib，目前结果待补充。
+- 实验 C 用于单独评估 adaptive `k/p` 模块，不叠加实验 B 的 Fisher-Calib，结果相对 Baseline 提升 `+0.104 Top-1`。
+- 实验 B 和实验 C 均能带来正向收益，说明 Fisher-Calib 与 adaptive `k/p` 分别具有独立贡献。
+- 实验 D 将 Fisher-Calib 与 adaptive `k/p` 结合后取得当前最优结果，说明二者在当前设置下具有叠加收益。
 - 当前更有效的做法不是全层统一增强 Fisher 项，而是根据 block 级统计和分类一致性自适应决定 Fisher-DPLR 参数。
 
 ## 方法动机
@@ -217,7 +218,7 @@ python test_quant.py --model deit_tiny --config ./configs/4bit/best.py --dataset
 说明：
 
 - 这条命令用于 adaptive `k/p` 消融，只考察 adaptive `k/p` 在块重构阶段的作用。
-- 当前实验 C 结果还未补充，README 表格中暂时保留为空。
+- 当前实验 C 的 W4A4 DeiT-Tiny 结果为 `66.904 Top-1 / 88.048 Top-5`，相对 Baseline 提升 `+0.104 Top-1`。
 - 实验 C 和实验 D 都启用 `--adaptive-candidate-select`，因此二者的 adaptive `k/p` 选择逻辑保持一致。
 
 ### 5. 实验 D / SynFIM-Q：Fisher-Calib + Adaptive `k/p`
