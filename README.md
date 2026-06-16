@@ -16,23 +16,23 @@ SynFIM-Q 是一个基于 PyTorch 的 Vision Transformer 后训练量化（Post-T
 
 ### W4A4 结果
 
-| 方法 | 起点 | `k/p` 策略 | Top-1 | Top-5 | 相对实验 1 |
-|---|---|---|---:|---:|---:|
-| 实验 1 / Baseline | MSE-Calib | 固定 `k/p` | 66.800 | - | - |
-| 实验 2 | Fisher-Calib | 固定 `k/p` | 67.198 | 88.258 | +0.398 |
-| 实验 3 / **SynFIM-Q** | Fisher-Calib | adaptive `k/p` | **67.414** | 88.302 | **+0.614** |
+| 方法 | 起点 | `k/p` 策略 | Top-1 | 相对实验 1 |
+|---|---|---|---:|---:|
+| 实验 1 / Baseline | MSE-Calib | 固定 `k/p` | 66.840 | - |
+| 实验 2 | Fisher-Calib | 固定 `k/p` | 67.198 | +0.358 |
+| 实验 3 / **SynFIM-Q** | Fisher-Calib | adaptive `k/p` | **67.414** | **+0.574** |
 
 ### W3A3 当前结果
 
-| 方法 | 起点 | `k/p` 策略 | Top-1 | Top-5 | 相对实验 1 |
-|---|---|---|---:|---:|---:|
-| 实验 1 / Baseline | MSE-Calib | 固定 `k/p` | 55.5 左右 | - | - |
-| 实验 2 | Fisher-Calib | 固定 `k/p` | 56.320 | 81.394 | 约 +0.820 |
-| 实验 3 / **SynFIM-Q** | Fisher-Calib | adaptive `k/p` | **56.476** | **81.478** | 约 **+0.976** |
+| 方法 | 起点 | `k/p` 策略 | Top-1 | 相对实验 1 |
+|---|---|---|---:|---:|
+| 实验 1 / Baseline | MSE-Calib | 固定 `k/p` | 55.550 | - |
+| 实验 2 | Fisher-Calib | 固定 `k/p` | 56.320 | +0.770 |
+| 实验 3 / **SynFIM-Q** | Fisher-Calib | adaptive `k/p` | **56.476** | **+0.926** |
 
 主要结论：
 
-- W4A4 下，实验 3 相比实验 1 / Baseline 提升 `+0.614 Top-1`，相比实验 2 提升 `+0.216 Top-1`。
+- W4A4 下，实验 3 相比实验 1 / Baseline 提升 `+0.574 Top-1`，相比实验 2 提升 `+0.216 Top-1`。
 - W3A3 下，实验 3 相比实验 2 提升 `+0.156 Top-1`，说明 Fisher-Calib 起点上继续加入 adaptive `k/p` 仍有增益。
 - 当前消融采用递进式设计：实验 1 作为 FIMA-Q baseline，实验 2 在实验 1 的基础上引入 Fisher-Calib，实验 3 在实验 2 的 Fisher-Calib 起点上继续叠加 adaptive `k/p` 候选选择。
 - 当前更有效的做法不是全层统一增强 Fisher 项，而是根据 block 级统计和分类一致性自适应决定 Fisher-DPLR 参数，尤其要避免早期 block 的噪声候选误放行。
@@ -345,7 +345,7 @@ SynFIM-Q/
 
 ## 注意事项
 
-- 当前主结果以 Top-1 为主要指标；Top-5 作为辅助参考。
+- 当前主结果以 Top-1 为主要指标。
 - 实验 1 是 FIMA-Q baseline 复现，必须显式关闭 adaptive `k/p`、candidate-select、logits guard 和 logit bias correction；尤其 3bit 配置文件中当前默认打开了 adaptive `k/p`，不能省略关闭开关。
 - 候选选择会增加运行时间，因为部分 block 会分别训练固定参数和自适应参数两个候选。
 - 为了保证对比严谨，实验 2 和实验 3 应加载同一个 Fisher-Calib checkpoint。
