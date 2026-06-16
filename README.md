@@ -24,11 +24,11 @@ SynFIM-Q 是一个基于 PyTorch 的 Vision Transformer 后训练量化（Post-T
 
 ### W3A3 当前结果
 
-| 方法 | 起点 | `k/p` 策略 | Top-1 | Top-5 | 相对实验 1 | 备注 |
-|---|---|---|---:|---:|---:|---|
-| 实验 1 / Baseline | MSE-Calib | 固定 `k/p` | 55.5 左右 | - | - | 当前以既有 baseline 记录为准 |
-| 实验 2 | Fisher-Calib | 固定 `k/p` | 56.320 | 81.394 | 约 +0.820 | 加载 3bit Fisher-Calib checkpoint |
-| 实验 3 / **SynFIM-Q** | Fisher-Calib | adaptive `k/p` | **56.476** | **81.478** | 约 **+0.976** | 当前 3bit 最优版本，启用 `safe_plus` 与 3bit strong adaptive 候选 |
+| 方法 | 起点 | `k/p` 策略 | Top-1 | Top-5 | 相对实验 1 |
+|---|---|---|---:|---:|---:|
+| 实验 1 / Baseline | MSE-Calib | 固定 `k/p` | 55.5 左右 | - | - |
+| 实验 2 | Fisher-Calib | 固定 `k/p` | 56.320 | 81.394 | 约 +0.820 |
+| 实验 3 / **SynFIM-Q** | Fisher-Calib | adaptive `k/p` | **56.476** | **81.478** | 约 **+0.976** |
 
 主要结论：
 
