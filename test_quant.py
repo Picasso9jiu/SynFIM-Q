@@ -125,6 +125,9 @@ def get_args_parser():
                                           help='Disable fixed/adaptive per-block candidate selection.')
     parser.add_argument('--adaptive-candidate-margin', type=float, default=None,
                         help='Score margin required for adaptive candidate to beat fixed candidate.')
+    parser.add_argument('--adaptive-3bit-select-profile', type=str, default='safe',
+                        choices=['safe', 'safe_plus', 'balanced', 'std_prior'],
+                        help='3bit-only adaptive profile. "safe" preserves the conservative guard; "safe_plus" relaxes reliable mid/late blocks; "balanced" accepts small consistent gains; "std_prior" keeps residual-aware k/p and adds a mild activation-std prior for MSE-Calib ablation.')
     parser.add_argument('--pct', type=float, default=argparse.SUPPRESS,
                         help='clamp percentile of mlp.fc2 input for GELU clamping.')
     parser.add_argument('--diagnose-residual-only', action='store_true',
@@ -170,6 +173,40 @@ def seed_all(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def capture_rng_state():
+    import random
+    return {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.random.get_rng_state(),
+        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_rng_state(state):
+    import random
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.random.set_rng_state(state['torch'])
+    if state['cuda'] is not None:
+        torch.cuda.set_rng_state_all(state['cuda'])
+
+
+def compute_residual_stats_safely(model, loader, cfg):
+    rng_state = capture_rng_state()
+    try:
+        residual_calibrator = QuantCalibrator(
+            model, loader,
+            calib_metric=cfg.calib_metric,
+            temperature=cfg.temp
+        )
+        block_residual_stats = residual_calibrator.compute_block_residual_stats()
+    finally:
+        restore_rng_state(rng_state)
+        model.zero_grad(set_to_none=True)
+    return block_residual_stats
 
 
 def get_cur_time():
@@ -428,6 +465,7 @@ def main(args):
     cfg.adaptive_candidate_margin = getattr(cfg, 'adaptive_candidate_margin', 0.003)
     if args.adaptive_candidate_margin is not None:
         cfg.adaptive_candidate_margin = args.adaptive_candidate_margin
+    cfg.adaptive_3bit_select_profile = args.adaptive_3bit_select_profile
     cfg.logit_guard = getattr(cfg, 'logit_guard', True)
     if hasattr(args, 'logit_guard'):
         cfg.logit_guard = True
@@ -550,12 +588,21 @@ def main(args):
                 val_loss, val_prec1, val_prec5 = validate(val_loader, model, criterion, print_freq=args.print_freq, device=device)
             if (cfg.adaptive_k or cfg.adaptive_p) and args.optimize:
                 residual_loader = g.calib_loader(num=cfg.calib_size, batch_size=cfg.calib_batch_size, seed=args.seed)
-                residual_calibrator = QuantCalibrator(
-                    model, residual_loader,
-                    calib_metric=cfg.calib_metric,
-                    temperature=cfg.temp
-                )
-                block_residual_stats = residual_calibrator.compute_block_residual_stats()
+                if cfg.w_bit == 3 or cfg.a_bit == 3:
+                    block_residual_stats = compute_residual_stats_safely(model, residual_loader, cfg)
+                    logging.info(
+                        "Reloading calibrated checkpoint after 3bit residual diagnostics: {}".format(
+                            args.load_calibrate_checkpoint
+                        )
+                    )
+                    model = load_model(model, args, device, mode='calibrate')
+                else:
+                    residual_calibrator = QuantCalibrator(
+                        model, residual_loader,
+                        calib_metric=cfg.calib_metric,
+                        temperature=cfg.temp
+                    )
+                    block_residual_stats = residual_calibrator.compute_block_residual_stats()
                 if args.diagnose_residual_only:
                     logging.info('Residual diagnostics finished; exiting before block reconstruction.')
                     return
@@ -583,12 +630,21 @@ def main(args):
                 )
                 model = load_model(model, args, device, mode='calibrate', ckpt_path=calibrate_ckpt_path)
             if (cfg.adaptive_k or cfg.adaptive_p) and args.optimize:
-                residual_calibrator = QuantCalibrator(
-                    model, calib_loader,
-                    calib_metric=cfg.calib_metric,
-                    temperature=cfg.temp
-                )
-                block_residual_stats = residual_calibrator.compute_block_residual_stats()
+                if cfg.w_bit == 3 or cfg.a_bit == 3:
+                    block_residual_stats = compute_residual_stats_safely(model, calib_loader, cfg)
+                    logging.info(
+                        "Reloading calibrated checkpoint after 3bit residual diagnostics: {}".format(
+                            calibrate_ckpt_path
+                        )
+                    )
+                    model = load_model(model, args, device, mode='calibrate', ckpt_path=calibrate_ckpt_path)
+                else:
+                    residual_calibrator = QuantCalibrator(
+                        model, calib_loader,
+                        calib_metric=cfg.calib_metric,
+                        temperature=cfg.temp
+                    )
+                    block_residual_stats = residual_calibrator.compute_block_residual_stats()
                 if args.diagnose_residual_only:
                     logging.info('Residual diagnostics finished; exiting before block reconstruction.')
                     return
@@ -624,6 +680,10 @@ def main(args):
             logit_guard_loader=logit_guard_loader,
             adaptive_candidate_select=cfg.adaptive_candidate_select,
             adaptive_candidate_margin=cfg.adaptive_candidate_margin,
+            w_bit=cfg.w_bit,
+            a_bit=cfg.a_bit,
+            calib_metric=cfg.calib_metric,
+            adaptive_3bit_select_profile=cfg.adaptive_3bit_select_profile,
         )
         # Share Fisher base if available (unified FIM framework).
         # NOTE: Skip sharing when Fisher calibration was used. The Fisher-guided

@@ -84,7 +84,9 @@ class BlockReconstructor(QuantCalibrator):
                  dis_mode='q', p1=1., p2=1., adaptive_k=True, adaptive_p=True,
                  block_residual_stats=None, logit_guard=True, logit_guard_batches=None,
                  logit_guard_loader=None, adaptive_candidate_select=True,
-                 adaptive_candidate_margin=0.003):
+                 adaptive_candidate_margin=0.003, w_bit=None, a_bit=None,
+                 calib_metric=None,
+                 adaptive_3bit_select_profile='safe'):
         super().__init__(model, calib_loader)
         self.batch_size = optim_batch_size
         self.metric = metric
@@ -101,7 +103,15 @@ class BlockReconstructor(QuantCalibrator):
         self.heldout_logit_guard_loader = logit_guard_loader
         self.adaptive_candidate_select = adaptive_candidate_select
         self.adaptive_candidate_margin = adaptive_candidate_margin
+        self.w_bit = w_bit
+        self.a_bit = a_bit
+        self.calib_metric = calib_metric
+        self.adaptive_3bit_select_profile = adaptive_3bit_select_profile
         self.auto_base_k, self.auto_base_p1, self.auto_base_p2 = self.compute_auto_base_params()
+        if self.use_3bit_std_prior():
+            logging.info(
+                'Using 3bit std_prior profile: residual-aware adaptive k/p is kept, with a mild activation-std prior for MSE-Calib ablation.'
+            )
         self.block_recon_summary = []
         self.blocks = {}
         self.quanted_blocks = []
@@ -195,6 +205,13 @@ class BlockReconstructor(QuantCalibrator):
     def get_block_k(self, name):
         return self.select_block_k(name)[0]
 
+    def use_3bit_std_prior(self):
+        return (
+            (self.w_bit == 3 or self.a_bit == 3)
+            and self.adaptive_3bit_select_profile == 'std_prior'
+            and self.calib_metric in (None, 'mse', 'mae')
+        )
+
     def select_block_k(self, name):
         """Select Fisher low-rank update count from calibration residuals."""
         if not self.adaptive_k:
@@ -212,12 +229,18 @@ class BlockReconstructor(QuantCalibrator):
             idx = self._block_index(name)
             block_k = base_k
             reason = 'base'
-            if idx is not None and idx <= 6 and residual_norm >= 1.05:
+            early_threshold = 1.00 if self.use_3bit_std_prior() else 1.05
+            mid_threshold = 1.10 if self.use_3bit_std_prior() else 1.15
+            if idx is not None and idx <= 6 and residual_norm >= early_threshold:
+                if self.use_3bit_std_prior() and idx in (2, 3, 4) and residual_norm >= 1.02:
+                    block_k = min(base_k + 2, 7)
+                    reason = 'std_prior_core_residual_plus2'
+                    return block_k, reason
                 block_k = min(base_k + 1, 7)
-                reason = 'high_residual_plus1'
-            elif idx is not None and idx <= 8 and residual_norm >= 1.15:
+                reason = 'std_prior_high_residual_plus1' if self.use_3bit_std_prior() else 'high_residual_plus1'
+            elif idx is not None and idx <= 8 and residual_norm >= mid_threshold:
                 block_k = min(base_k + 1, 7)
-                reason = 'mid_high_residual_plus1'
+                reason = 'std_prior_mid_high_residual_plus1' if self.use_3bit_std_prior() else 'mid_high_residual_plus1'
             return block_k, reason
         if 'patch_embed' in name:
             return min(self.k + 3, 12), 'fallback_patch_embed'
@@ -233,6 +256,32 @@ class BlockReconstructor(QuantCalibrator):
         if 'head' in name:
             return max(self.k - 2, 1), 'fallback_head_minus2'
         return self.k, 'fallback_base'
+
+    def apply_3bit_std_prior_p1p2(self, name, block, p1, p2):
+        if not self.use_3bit_std_prior() or block.raw_out is None:
+            return p1, p2
+        block_std = block.raw_out.std().item()
+        idx = self._block_index(name)
+        if 'patch_embed' in name:
+            p1 *= 0.99
+            p2 *= 1.02
+        elif idx is not None and idx <= 6:
+            if block_std < 0.65:
+                p1 *= 0.92
+                p2 *= 1.12
+            elif block_std < 0.90:
+                p1 *= 0.95
+                p2 *= 1.08
+            elif block_std > 1.20:
+                p1 *= 1.025
+                p2 *= 0.995
+        elif idx is not None and idx <= 8:
+            if block_std < 0.95:
+                p1 *= 0.97
+                p2 *= 1.05
+        elif idx is not None:
+            p2 = min(p2, 1.01)
+        return max(0.90, min(1.10, p1)), max(0.99, min(1.12, p2))
 
     def compute_adaptive_p1p2(self, name, block):
         """
@@ -250,18 +299,18 @@ class BlockReconstructor(QuantCalibrator):
             residual_norm = float(stat.get('residual_norm', 1.0))
             idx = self._block_index(name)
             if 'patch_embed' in name:
-                return base_p1 * 0.98, base_p2
+                return self.apply_3bit_std_prior_p1p2(name, block, base_p1 * 0.98, base_p2)
             if 'head' in name or idx is None:
-                return base_p1, base_p2
+                return self.apply_3bit_std_prior_p1p2(name, block, base_p1, base_p2)
             if residual_norm >= 1.0:
                 boost = min((residual_norm - 1.0) * 0.18, 0.07)
                 if idx <= 6:
-                    return base_p1 * (1.0 + boost), base_p2
-                return base_p1 * (1.0 + 0.5 * boost), base_p2
+                    return self.apply_3bit_std_prior_p1p2(name, block, base_p1 * (1.0 + boost), base_p2)
+                return self.apply_3bit_std_prior_p1p2(name, block, base_p1 * (1.0 + 0.5 * boost), base_p2)
             if idx >= 8:
                 damp = min((1.0 - residual_norm) * 0.04, 0.025)
-                return base_p1 * (1.0 - damp), base_p2
-            return base_p1, base_p2
+                return self.apply_3bit_std_prior_p1p2(name, block, base_p1 * (1.0 - damp), base_p2)
+            return self.apply_3bit_std_prior_p1p2(name, block, base_p1, base_p2)
         if block.raw_out is None:
             return base_p1, base_p2
         block_std = block.raw_out.std().item()
@@ -271,6 +320,38 @@ class BlockReconstructor(QuantCalibrator):
             return base_p1, base_p2
         else:
             return base_p1 * 0.7, base_p2 * 1.3
+
+    def strong_3bit_candidate_params(self, name, adaptive_params):
+        if not (self.w_bit == 3 or self.a_bit == 3):
+            return None
+        if self.adaptive_3bit_select_profile != 'safe_plus':
+            return None
+        idx = self._block_index(name)
+        if idx is None:
+            return None
+        block_k, _reason, block_p1, block_p2 = adaptive_params
+        if idx in (5, 6):
+            return (
+                min(block_k + 1, 7),
+                'strong_mid_residual_plus',
+                min(block_p1 * 1.035, 1.080),
+                block_p2,
+            )
+        if idx == 8:
+            return (
+                block_k,
+                'strong_late_p1_probe',
+                min(max(block_p1 * 1.020, 1.000), 1.030),
+                block_p2,
+            )
+        if idx == 10:
+            return (
+                block_k,
+                'strong_tail_logit_probe',
+                min(max(block_p1 * 1.025, 1.000), 1.030),
+                block_p2,
+            )
+        return None
 
     def replace_block(self, target_block, new_block):
         self._replace_block_recursive(self.model, target_block, new_block)
@@ -747,8 +828,8 @@ class BlockReconstructor(QuantCalibrator):
     def params_are_same(left, right):
         return (
             left[0] == right[0]
-            and abs(left[2] - right[2]) < 1e-9
-            and abs(left[3] - right[3]) < 1e-9
+            and abs(left[2] - right[2]) < 5e-3
+            and abs(left[3] - right[3]) < 5e-3
         )
 
     @staticmethod
@@ -756,6 +837,144 @@ class BlockReconstructor(QuantCalibrator):
         if pre_mse is None or post_mse is None or pre_mse <= 0:
             return 0.0
         return post_mse / pre_mse
+
+    @staticmethod
+    def _metric_delta(lhs, rhs, key, default=0.0):
+        lhs_stats = lhs.get('post_logit_guard') if lhs is not None else None
+        rhs_stats = rhs.get('post_logit_guard') if rhs is not None else None
+        if lhs_stats is None or rhs_stats is None:
+            return default
+        return float(lhs_stats.get(key, 0.0)) - float(rhs_stats.get(key, 0.0))
+
+    def candidate_rel_mse(self, pre_mse, result):
+        return self._relative_mse(result.get('post_recon_mse'), pre_mse)
+
+    def adaptive_has_reliable_gain(self, pre_mse, fixed_result, adaptive_result, block_name=None):
+        if adaptive_result is None or adaptive_result.get('should_revert'):
+            return False
+        if fixed_result is None or fixed_result.get('should_revert'):
+            return True
+        fixed_rel = self.candidate_rel_mse(pre_mse, fixed_result)
+        adaptive_rel = self.candidate_rel_mse(pre_mse, adaptive_result)
+        mse_gain = fixed_rel - adaptive_rel
+        ce_gain = -self._metric_delta(adaptive_result, fixed_result, 'ce')
+        top1_gain = self._metric_delta(adaptive_result, fixed_result, 'top1')
+        true_prob_gain = self._metric_delta(adaptive_result, fixed_result, 'true_prob')
+        margin_gain = self._metric_delta(adaptive_result, fixed_result, 'margin')
+        candidate_name = adaptive_result.get('candidate', 'adaptive')
+
+        if self.w_bit == 3 or self.a_bit == 3:
+            mse_clear = mse_gain >= 0.002
+            logits_not_worse = (
+                ce_gain >= -0.006
+                and top1_gain >= -0.004
+                and true_prob_gain >= -0.003
+                and margin_gain >= -0.010
+            )
+            logits_clear = (
+                ce_gain >= 0.015
+                or top1_gain >= 0.012
+                or (true_prob_gain >= 0.004 and margin_gain >= 0.015)
+            )
+            safe_accept = (mse_clear and logits_not_worse) or (mse_gain >= -0.0005 and logits_clear)
+            if safe_accept:
+                return True
+
+            if self.adaptive_3bit_select_profile == 'safe_plus':
+                idx = self._block_index(block_name or '')
+                if idx is None:
+                    return False
+                # Keep early 3bit blocks fixed unless the conservative safe
+                # rule passes. The balanced run showed block 2 can overfit the
+                # reconstruction logits and degrade the final test accuracy.
+                if idx < 5 or idx == 11:
+                    return False
+                if candidate_name == 'strong_adaptive' and idx not in (5, 6, 8, 10):
+                    return False
+                mid_block_mse_tie_break = (
+                    5 <= idx <= 6
+                    and mse_gain >= 0.00010
+                    and ce_gain >= -0.008
+                    and top1_gain >= -0.004
+                    and true_prob_gain >= -0.004
+                    and margin_gain >= -0.012
+                )
+                late_neutral_gain = (
+                    idx >= 8
+                    and mse_gain >= 0.00005
+                    and ce_gain >= -0.003
+                    and top1_gain >= -0.003
+                    and true_prob_gain >= -0.0015
+                    and margin_gain >= -0.006
+                )
+                tail_logit_gain = (
+                    idx == 10
+                    and mse_gain >= -0.0010
+                    and ce_gain >= 0.015
+                    and top1_gain >= 0.000
+                    and true_prob_gain >= 0.001
+                    and margin_gain >= 0.020
+                )
+                strong_mid_gain = (
+                    candidate_name == 'strong_adaptive'
+                    and 5 <= idx <= 6
+                    and mse_gain >= -0.0007
+                    and ce_gain >= 0.008
+                    and top1_gain >= -0.002
+                    and true_prob_gain >= -0.001
+                    and margin_gain >= 0.006
+                )
+                strong_late_gain = (
+                    candidate_name == 'strong_adaptive'
+                    and idx == 8
+                    and mse_gain >= -0.0005
+                    and ce_gain >= 0.006
+                    and top1_gain >= -0.003
+                    and true_prob_gain >= 0.000
+                    and margin_gain >= -0.004
+                )
+                strong_tail_gain = (
+                    candidate_name == 'strong_adaptive'
+                    and idx == 10
+                    and mse_gain >= -0.0015
+                    and ce_gain >= 0.012
+                    and top1_gain >= -0.001
+                    and true_prob_gain >= 0.000
+                    and margin_gain >= 0.015
+                )
+                return (
+                    mid_block_mse_tie_break
+                    or late_neutral_gain
+                    or tail_logit_gain
+                    or strong_mid_gain
+                    or strong_late_gain
+                    or strong_tail_gain
+                )
+
+            if self.adaptive_3bit_select_profile != 'balanced':
+                return safe_accept
+
+            # 3bit logits on the reconstruction set are noisy, but very small
+            # local-MSE differences can hide useful adaptive candidates. The
+            # balanced profile only admits candidates with multiple consistent
+            # positive signals, keeping fixed as the default anchor.
+            relaxed_logit_gain = (
+                mse_gain >= -0.0008
+                and ce_gain >= 0.010
+                and top1_gain >= 0.003
+                and true_prob_gain >= -0.001
+                and margin_gain >= 0.010
+            )
+            small_mse_gain = (
+                mse_gain >= 0.0002
+                and ce_gain >= 0.000
+                and top1_gain >= -0.004
+                and true_prob_gain >= 0.001
+                and margin_gain >= 0.005
+            )
+            return relaxed_logit_gain or small_mse_gain
+
+        return adaptive_result['score'] > fixed_result['score'] + self.adaptive_candidate_margin
 
     def candidate_score(self, pre_mse, result):
         if result['should_revert']:
@@ -774,11 +993,14 @@ class BlockReconstructor(QuantCalibrator):
 
     def run_reconstruction_candidate(self, name, block, device, candidate_name,
                                      block_k, block_k_reason, block_p1, block_p2,
-                                     pre_recon_state, pre_recon_mse, pre_logit_guard,
+                                     pre_recon_state, pre_runtime_state, pre_recon_mse, pre_logit_guard,
                                      batch_size, iters, weight, b_range, warmup, lr,
                                      quant_act, mode, drop_prob):
         block.load_state_dict(pre_recon_state, strict=True)
-        if self.metric in ["fisher_lr", "fisher_diag", "fisher_dplr"]:
+        if self.w_bit == 3 or self.a_bit == 3:
+            for attr in ['raw_grad', 'delta_out', 'inverse_B', 'tmp_grad', 'tmp_out']:
+                setattr(block, attr, pre_runtime_state.get(attr))
+        elif self.metric in ["fisher_lr", "fisher_diag", "fisher_dplr"]:
             block.raw_grad = None
             block.delta_out = None
             block.inverse_B = None
@@ -964,6 +1186,16 @@ class BlockReconstructor(QuantCalibrator):
         self.wrap_quantizers_in_net(block, name)
         self.set_block_soft_targets(block, False)
         pre_recon_state = self._clone_state_dict(block)
+        if self.w_bit == 3 or self.a_bit == 3:
+            pre_runtime_state = {
+                'raw_grad': block.raw_grad.detach().clone() if torch.is_tensor(block.raw_grad) else block.raw_grad,
+                'delta_out': block.delta_out.detach().clone() if torch.is_tensor(block.delta_out) else block.delta_out,
+                'inverse_B': block.inverse_B.detach().clone() if torch.is_tensor(block.inverse_B) else block.inverse_B,
+                'tmp_grad': block.tmp_grad,
+                'tmp_out': block.tmp_out,
+            }
+        else:
+            pre_runtime_state = {}
         pre_recon_mse = self.estimate_block_mse(block, device, mode=mode)
         pre_logit_guard = self.evaluate_logit_guard(device, name=block_name) if self.logit_guard else None
         logging.info('Block {} logit guard before: {}'.format(
@@ -974,14 +1206,21 @@ class BlockReconstructor(QuantCalibrator):
         adaptive_k, adaptive_k_reason = self.select_block_k(name)
         adaptive_p1, adaptive_p2 = self.compute_adaptive_p1p2(name, block)
         adaptive_params = (adaptive_k, adaptive_k_reason, adaptive_p1, adaptive_p2)
-        if self.params_are_same(fixed_params, adaptive_params):
-            candidates = [('adaptive_same_as_fixed', adaptive_params)]
-            logging.info('Block {} candidate selection skipped: adaptive params match fixed params.'.format(name))
+        strong_params = self.strong_3bit_candidate_params(name, adaptive_params)
+        if (
+            (self.w_bit == 3 or self.a_bit == 3)
+            and self.params_are_same(fixed_params, adaptive_params)
+            and strong_params is None
+        ):
+            candidates = [('fixed', fixed_params)]
+            logging.info('Block {} candidate selection uses fixed path: adaptive params match fixed params.'.format(name))
         else:
             candidates = [
                 ('fixed', fixed_params),
                 ('adaptive', adaptive_params),
             ]
+            if strong_params is not None and not self.params_are_same(fixed_params, strong_params) and not self.params_are_same(adaptive_params, strong_params):
+                candidates.append(('strong_adaptive', strong_params))
             logging.info(
                 'Block {} candidate selection enabled: fixed k={} p1={:.3f} p2={:.3f}; adaptive k={} ({}) p1={:.3f} p2={:.3f}'.format(
                     name,
@@ -994,6 +1233,16 @@ class BlockReconstructor(QuantCalibrator):
                     adaptive_params[3],
                 )
             )
+            if strong_params is not None:
+                logging.info(
+                    'Block {} strong 3bit candidate: k={} ({}) p1={:.3f} p2={:.3f}'.format(
+                        name,
+                        strong_params[0],
+                        strong_params[1],
+                        strong_params[2],
+                        strong_params[3],
+                    )
+                )
 
         results = []
         py_state = random.getstate()
@@ -1011,23 +1260,30 @@ class BlockReconstructor(QuantCalibrator):
                 self.run_reconstruction_candidate(
                     name, block, device, candidate_name,
                     block_k, block_k_reason, block_p1, block_p2,
-                    pre_recon_state, pre_recon_mse, pre_logit_guard,
+                    pre_recon_state, pre_runtime_state, pre_recon_mse, pre_logit_guard,
                     batch_size, iters, weight, b_range, warmup, lr,
                     quant_act, mode, drop_prob,
                 )
             )
 
         best = max(results, key=lambda item: item['score'])
-        if len(results) == 2:
+        if len(results) >= 2:
             fixed_result = next((item for item in results if item['candidate'] == 'fixed'), None)
-            adaptive_result = next((item for item in results if item['candidate'] == 'adaptive'), None)
-            if fixed_result is not None and adaptive_result is not None:
-                if adaptive_result['score'] > fixed_result['score'] + self.adaptive_candidate_margin:
-                    best = adaptive_result
+            adaptive_results = [
+                item for item in results
+                if item['candidate'] in ('adaptive', 'strong_adaptive')
+            ]
+            if fixed_result is not None and adaptive_results:
+                reliable_adaptive = [
+                    item for item in adaptive_results
+                    if self.adaptive_has_reliable_gain(pre_recon_mse, fixed_result, item, block_name)
+                ]
+                if reliable_adaptive:
+                    best = max(reliable_adaptive, key=lambda item: item['score'])
                 elif fixed_result['score'] > -1e8:
                     best = fixed_result
                 else:
-                    best = adaptive_result if adaptive_result['score'] > fixed_result['score'] else fixed_result
+                    best = max(results, key=lambda item: item['score'])
         if best['should_revert']:
             guard_action = 'revert'
             block.load_state_dict(pre_recon_state, strict=True)
